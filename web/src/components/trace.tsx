@@ -5,6 +5,15 @@ import { Card, CardHeader, CardTitle, CardDescription, CardContent } from './ui/
 import { Button } from './ui/button';
 import { Accordion, AccordionItem, AccordionTrigger, AccordionContent } from './ui/accordion';
 import { Checkbox } from './ui/checkbox';
+import { Callout } from './ui/callout';
+import { TextField, TextFieldInput, TextFieldLabel } from './ui/text-field';
+import {
+  NumberField,
+  NumberFieldLabel,
+  NumberFieldGroup,
+  NumberFieldInput,
+  NumberFieldErrorMessage,
+} from './ui/number-field';
 import {
   Combobox,
   ComboboxControl,
@@ -94,26 +103,43 @@ export function Trace(props: {
   const [direction, setDirection] = createSignal('');
   const [kind, setKind] = createSignal('');
   const [errors, setErrors] = createSignal(false);
-  const endpoints = createMemo(() => [
-    'All',
-    ...new Set(
-      props.records.flatMap((r) => {
-        const p = r.event.type === 'host' ? hostEvent(r.event.event) : null;
-        return p && 'endpoint' in p[1] ? [String(p[1].endpoint)] : [];
-      }),
-    ),
-  ]);
+  const [search, setSearch] = createSignal('');
+  const searchQuery = createMemo(() => search().trim().toLowerCase());
+  const endpointInvalid = createMemo(
+    () =>
+      endpoint() !== '' &&
+      (!/^\d+$/.test(endpoint()) ||
+        !Number.isInteger(Number(endpoint())) ||
+        Number(endpoint()) < 0 ||
+        Number(endpoint()) > 255),
+  );
   const records = createMemo(() => props.records, undefined, {
     equals: (a, b) => a.length === b.length && a.every((r, i) => r === b[i]),
   });
   const [expanded, setExpanded] = createSignal(new Map<ProtocolRecord, boolean>());
   const newest = createMemo(() =>
-    filterTrace(groupTrace(records()), {
-      endpoint: endpoint(),
-      direction: direction().toLowerCase(),
-      kind: kind().toLowerCase(),
-      errors: errors(),
-    }).reverse(),
+    endpointInvalid()
+      ? []
+      : filterTrace(groupTrace(records()), {
+          endpoint: endpoint(),
+          direction: direction().toLowerCase(),
+          kind: kind().toLowerCase(),
+          errors: errors(),
+        })
+          .filter(
+            (group) =>
+              !searchQuery() ||
+              group.records.some((record) => {
+                const packet = record.event.type === 'host' ? hostEvent(record.event.event) : null;
+                const text = [summary(record)];
+                if (packet?.[0] === 'transfer') {
+                  text.push(packet[1].data.map((value) => hex(value).slice(2)).join(' '));
+                  if (packet[1].pid === 3) text.push(decodeSetup(packet[1].data));
+                }
+                return text.some((value) => value.toLowerCase().includes(searchQuery()));
+              }),
+          )
+          .reverse(),
   );
   return (
     <Card class="mt-5 min-w-0">
@@ -139,7 +165,7 @@ export function Trace(props: {
       </CardHeader>
       <CardContent>
         <Show when={props.transportDropped > 0 || props.hostDropped > 0}>
-          <div class="notice notice-error">
+          <Callout variant="warning" class="mb-4 text-sm">
             Some activity records are missing.
             <Accordion collapsible>
               <AccordionItem value="loss">
@@ -150,15 +176,30 @@ export function Trace(props: {
                 </AccordionContent>
               </AccordionItem>
             </Accordion>
-          </div>
+          </Callout>
         </Show>
         <div class="mb-4 flex flex-wrap items-end gap-3">
-          <TraceFilter
-            label="Endpoint"
-            options={endpoints()}
+          <NumberField
+            class="grid w-40 gap-1"
             value={endpoint()}
             onChange={setEndpoint}
-          />
+            minValue={0}
+            maxValue={255}
+            step={1}
+            format={false}
+            changeOnWheel={false}
+            validationState={endpointInvalid() ? 'invalid' : 'valid'}
+          >
+            <NumberFieldLabel class="text-xs font-normal text-muted-foreground">
+              Endpoint
+            </NumberFieldLabel>
+            <NumberFieldGroup>
+              <NumberFieldInput placeholder="All" />
+            </NumberFieldGroup>
+            <NumberFieldErrorMessage>
+              Enter a whole number from 0 to 255, or clear for all.
+            </NumberFieldErrorMessage>
+          </NumberField>
           <TraceFilter
             label="Direction"
             options={['All', 'IN', 'OUT']}
@@ -171,6 +212,12 @@ export function Trace(props: {
             value={kind()}
             onChange={setKind}
           />
+          <TextField class="min-w-0 w-full sm:w-64" value={search()} onChange={setSearch}>
+            <TextFieldLabel class="text-xs font-normal text-muted-foreground">
+              Search USB trace
+            </TextFieldLabel>
+            <TextFieldInput type="search" placeholder="Summary, SETUP or hex bytes" />
+          </TextField>
           <Checkbox class="mb-3" checked={errors()} onChange={setErrors}>
             Errors only
           </Checkbox>

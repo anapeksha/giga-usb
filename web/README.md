@@ -31,15 +31,16 @@ Exports are oldest-first. A browser-local `sequence` field counts all validated
 arrivals, including omitted records, to prevent false context/packet adjacency.
 Expanded packet details stay open while polling and when new records arrive.
 
-The accordion, combobox and checkbox wrappers in `src/components/ui/` are
-source-copied from the [solid-ui registry](https://github.com/stefan-karger/solid-ui/tree/main/apps/docs/src/registry/ui)
-and adapted to the existing dark theme, focus styles and labeled controls using
-`@kobalte/core`. The existing table wrapper is also source-copied solid-ui.
-These are local components, not an additional component-library dependency.
-See the official [accordion](https://www.solid-ui.com/docs/components/accordion),
-[combobox](https://www.solid-ui.com/docs/components/combobox),
-[checkbox](https://www.solid-ui.com/docs/components/checkbox) and
-[table](https://www.solid-ui.com/docs/components/table) documentation.
+Components in `src/components/ui/` are source-copied from
+[solid-ui](https://www.solid-ui.com/docs) and adapted to the dark theme using
+Kobalte primitives. Notifications use `solid-sonner`. Buttons reflect TanStack
+query/mutation loading states; **Request queued** means acceptance, not execution.
+Persistent errors remain visible in callouts after the toast closes.
+
+Filter by endpoint, direction or transfer type, or search summaries, decoded
+requests and hex bytes. Filters do not change capture or exported history.
+The trace uses a semantic table; sorting and pagination are intentionally omitted
+to preserve transfer order and adjacent context.
 
 ## Develop locally
 

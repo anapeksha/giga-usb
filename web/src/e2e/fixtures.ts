@@ -11,6 +11,7 @@ export const test = base.extend<
       commands: Command[];
       cursors: number[];
       commandStatus: number;
+      holdCommand: (command: Command, status?: number) => () => void;
       pending: boolean;
       malformed: boolean;
       onCommand?: (command: Command) => void;
@@ -46,11 +47,27 @@ export const test = base.extend<
     { scope: 'worker' },
   ],
   api: async ({ page }, use) => {
+    const releases = new Set<() => void>();
+    let held: { command: Command; status: number; wait: Promise<void> } | undefined;
     const api = {
       records: [] as ProtocolRecord[],
       commands: [] as Command[],
       cursors: [] as number[],
       commandStatus: 202,
+      holdCommand(command: Command, status = 202) {
+        let release!: () => void;
+        const wait = new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, 5000);
+          release = () => {
+            clearTimeout(timer);
+            releases.delete(release);
+            resolve();
+          };
+        });
+        releases.add(release);
+        held = { command, status, wait };
+        return release;
+      },
       pending: false,
       malformed: false,
       onCommand: undefined as ((command: Command) => void) | undefined,
@@ -65,7 +82,13 @@ export const test = base.extend<
         const { command } = route.request().postDataJSON() as { command: Command };
         api.commands.push(command);
         api.onCommand?.(command);
-        await route.fulfill({ status: api.commandStatus });
+        const gate =
+          held && JSON.stringify(held.command) === JSON.stringify(command) ? held : undefined;
+        if (gate) {
+          held = undefined;
+          await gate.wait;
+        }
+        await route.fulfill({ status: gate?.status ?? api.commandStatus });
       } else if (url.pathname === '/api/events') {
         const after = Number(url.searchParams.get('after'));
         api.cursors.push(after);
@@ -79,7 +102,11 @@ export const test = base.extend<
         throw new Error(`Unexpected API request: ${url.pathname}`);
       }
     });
-    await use(api);
+    try {
+      await use(api);
+    } finally {
+      for (const release of releases) release();
+    }
   },
 });
 export { expect };

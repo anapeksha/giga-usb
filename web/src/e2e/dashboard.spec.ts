@@ -35,14 +35,20 @@ test('status failure does not block polling; acceptance is not execution and que
   api.commandStatus = 503;
   await page.goto(appURL);
   await expect(page.getByRole('button', { name: 'Disconnect', exact: true })).toBeVisible();
-  await expect(page.getByRole('status')).toContainText('queue full');
+  await expect(
+    page.locator('[data-sonner-toast]').filter({ hasText: 'queue full' }).last(),
+  ).toBeVisible();
   api.commandStatus = 202;
   await page.getByRole('button', { name: 'Start', exact: true }).click();
-  await expect(page.getByRole('status')).toHaveText('Request accepted.');
+  await expect(
+    page.locator('[data-sonner-toast]').filter({ hasText: 'Request queued.' }),
+  ).toBeVisible();
   await expect(page.getByText('No device reported', { exact: true })).toBeVisible();
   api.commandStatus = 503;
   await page.getByRole('button', { name: 'Stop', exact: true }).click();
-  await expect(page.getByRole('status')).toContainText('queue full');
+  await expect(
+    page.locator('[data-sonner-toast]').filter({ hasText: 'queue full' }).last(),
+  ).toBeVisible();
   const polls = api.cursors.length;
   await expect.poll(() => api.cursors.length).toBeGreaterThan(polls + 2);
   expect(api.commands).toEqual(['status', 'start', 'stop']);
@@ -51,9 +57,12 @@ test('status failure does not block polling; acceptance is not execution and que
 test('connecting can be cancelled while requests are pending', async ({ page, api, appURL }) => {
   api.pending = true;
   await page.goto(appURL);
-  await page.getByRole('button', { name: 'Cancel connection' }).click();
+  const cancel = page.getByRole('button', { name: 'Cancel connection' });
+  await expect(cancel).toHaveAttribute('aria-busy', 'true');
+  await expect(cancel).toBeEnabled();
+  await cancel.click();
   await expect(page.getByRole('button', { name: 'Connect', exact: true })).toBeVisible();
-  await expect(page.getByRole('status')).toHaveText('Disconnected.');
+  await expect(page.locator('[data-sonner-toast]')).toHaveText('Disconnected.');
   api.pending = false;
   await page.getByRole('button', { name: 'Connect', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Disconnect', exact: true })).toBeVisible();
@@ -89,8 +98,38 @@ test('trace filters decode fixture records; reconnect resets cursor without repl
   await page.goto(appURL);
   const trace = page.getByRole('region', { name: 'USB trace records' });
   await expect(trace.getByText('Received · endpoint 129', { exact: true })).toBeVisible();
-  await page.getByRole('combobox', { name: 'Endpoint', exact: true }).fill('0');
-  await page.getByRole('option', { name: '0', exact: true }).click();
+  const search = page.getByRole('searchbox', { name: 'Search USB trace', exact: true });
+  const context = trace.getByRole('button', { name: 'transfer context', exact: true });
+  const setupPacket = trace.getByRole('button', { name: 'Sent · endpoint 0', exact: true });
+  for (const query of ['80 06', '  gEt DeScRiPtOr  ']) {
+    await search.fill(query);
+    await expect(setupPacket).toBeVisible();
+    await expect(context).toBeVisible();
+    await expect(trace.getByText('Received · endpoint 129', { exact: true })).toHaveCount(0);
+  }
+  await setupPacket.click();
+  await expect(trace.getByText(/Get descriptor/)).toBeVisible();
+  await context.click();
+  await expect(trace.locator('pre').filter({ hasText: '"transfer_context"' })).toContainText(
+    '"transfer_id": 1',
+  );
+  await setupPacket.click();
+  await search.fill('  RECEIVED · ENDPOINT 129  ');
+  await expect(trace.getByText('Received · endpoint 129', { exact: true })).toBeVisible();
+  await expect(context).toHaveCount(0);
+  await expect(setupPacket).toHaveCount(0);
+  const exportedDownload = page.waitForEvent('download');
+  await page.getByRole('button', { name: 'Export trace', exact: true }).click();
+  const exported = JSON.parse(await readFile((await (await exportedDownload).path())!, 'utf8'));
+  expect(exported.map((record: { event: unknown }) => record.event)).toEqual(
+    api.records.map((record) => record.event),
+  );
+  await search.fill('');
+  await expect(context).toBeVisible();
+  await expect(setupPacket).toBeVisible();
+  await expect(trace.getByText('Received · endpoint 129', { exact: true })).toBeVisible();
+  await page.getByRole('spinbutton', { name: 'Endpoint', exact: true }).fill('0');
+  await page.getByRole('spinbutton', { name: 'Endpoint', exact: true }).press('Tab');
   await page.getByRole('combobox', { name: 'Direction', exact: true }).fill('OUT');
   await expect(page.getByRole('listbox')).toBeVisible();
   expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
@@ -173,11 +212,16 @@ test('storage downloads 301 bytes in ordered 128-byte chunks with matching SHA-2
     },
   });
   api.onCommand = (command) => {
-    if (command === 'storage_list')
+    if (command === 'storage_list') {
+      api.emit({
+        type: 'host',
+        event: { file: { index: 1, name: 'OTHER.BIN', size: 1, directory: false } },
+      });
       api.emit({
         type: 'host',
         event: { file: { index: 0, name: 'TEST.BIN', size: bytes.length, directory: false } },
       });
+    }
     if (typeof command === 'object') {
       const { offset } = command.storage_read;
       api.emit({
@@ -199,9 +243,18 @@ test('storage downloads 301 bytes in ordered 128-byte chunks with matching SHA-2
   const downloadButton = page.getByRole('button', { name: 'Download TEST.BIN', exact: true });
   await expect(downloadButton).toBeEnabled();
   expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
+  const release = api.holdCommand({ storage_read: { file: 0, offset: 0 } });
   const pending = page.waitForEvent('download');
   await downloadButton.click();
+  await expect(downloadButton).toHaveAttribute('aria-busy', 'true');
+  await expect(page.getByRole('button', { name: 'Stop', exact: true })).toBeEnabled();
+  const other = page.getByRole('button', { name: 'Download OTHER.BIN', exact: true });
+  await expect(other).toBeDisabled();
+  await expect(other).not.toHaveAttribute('aria-busy', 'true');
+  await expect(page.getByRole('button', { name: 'List files', exact: true })).toBeDisabled();
+  release();
   const download = await pending;
+  await expect(downloadButton).not.toHaveAttribute('aria-busy', 'true');
   expect(download.suggestedFilename()).toBe('TEST.BIN');
   const path = await download.path();
   expect(path).not.toBeNull();
@@ -222,7 +275,9 @@ test('malformed responses show actionable errors and remain accessible', async (
 }) => {
   api.malformed = true;
   await page.goto(appURL);
-  await expect(page.getByRole('status')).toContainText('Invalid events response');
+  await expect(
+    page.getByRole('alert').filter({ hasText: 'Invalid events response' }),
+  ).toBeVisible();
   await expect(page.getByRole('button', { name: 'Connect', exact: true })).toBeVisible();
   expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
 });
@@ -282,4 +337,138 @@ test('non-USB floods preserve trace, open details and USB-only JSON export', asy
     true,
   );
   expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
+});
+
+test('pending commands mark only the clicked button busy, keep polling and reset after errors', async ({
+  page,
+  api,
+  appURL,
+}) => {
+  await page.goto(appURL);
+  const start = page.getByRole('button', { name: 'Start', exact: true });
+  const stop = page.getByRole('button', { name: 'Stop', exact: true });
+  await expect(start).toBeEnabled();
+  for (const status of [503, 202]) {
+    const release = api.holdCommand('start', status);
+    await start.click();
+    await expect(start).toHaveAttribute('aria-busy', 'true');
+    for (const name of ['Start', 'Stop', 'Reset USB', 'Refresh USB status']) {
+      const button = page.getByRole('button', { name, exact: true });
+      await expect(button).toBeDisabled();
+      if (name !== 'Start') await expect(button).not.toHaveAttribute('aria-busy', 'true');
+    }
+    const polls = api.cursors.length;
+    await expect.poll(() => api.cursors.length).toBeGreaterThan(polls + 1);
+    release();
+    await expect(start).toBeEnabled();
+    await expect(start).not.toHaveAttribute('aria-busy', 'true');
+    await expect(stop).toBeEnabled();
+    if (status === 503) {
+      await expect(page.getByRole('alert').filter({ hasText: 'queue full' })).toBeVisible();
+    } else {
+      await expect(
+        page.locator('[data-sonner-toast]').filter({ hasText: 'Request queued.' }),
+      ).toBeVisible();
+      await expect(page.getByRole('alert').filter({ hasText: 'queue full' })).toHaveCount(0);
+    }
+  }
+  expect(api.commands).toEqual(['status', 'start', 'start']);
+});
+
+for (const width of [320, 375, 1280]) {
+  test(`endpoint bounds, keyboard tooltip and persistent errors are accessible at ${width}px`, async ({
+    page,
+    api,
+    appURL,
+  }) => {
+    await page.setViewportSize({ width, height: 900 });
+    for (const endpoint of [129, 130]) {
+      api.emit({
+        type: 'host',
+        event: { transfer: { endpoint, direction: 'in', bytes: 1, pid: 2, data: [1] } },
+      });
+    }
+    await page.goto(appURL);
+    const disconnect = page.getByRole('button', { name: 'Disconnect', exact: true });
+    await disconnect.focus();
+    await expect(page.getByRole('tooltip')).toContainText(
+      'Disconnecting leaves the USB host running',
+    );
+    await page.keyboard.press('Escape');
+    const endpoint = page.getByRole('spinbutton', { name: 'Endpoint', exact: true });
+    await endpoint.fill('255');
+    await endpoint.press('Tab');
+    await expect(endpoint).toHaveValue('255');
+    const trace = page.getByRole('region', { name: 'USB trace records' });
+    await expect(endpoint).not.toHaveAttribute('aria-invalid', 'true');
+    await expect(trace.getByText(/No matching events/)).toBeVisible();
+    await expect(
+      trace.getByRole('button', { name: 'Received · endpoint 129', exact: true }),
+    ).toHaveCount(0);
+    for (const invalid of ['256', '-1']) {
+      await endpoint.fill(invalid);
+      await endpoint.press('Tab');
+      await expect(endpoint).toHaveValue(invalid);
+      await expect(endpoint).toHaveAttribute('aria-invalid', 'true');
+      await expect(
+        page.getByText('Enter a whole number from 0 to 255, or clear for all.', { exact: true }),
+      ).toBeVisible();
+      await expect(page.getByText('No matching events', { exact: false })).toBeVisible();
+    }
+    await endpoint.fill('0');
+    await endpoint.press('Tab');
+    await expect(endpoint).toHaveValue('0');
+    await expect(endpoint).not.toHaveAttribute('aria-invalid', 'true');
+    await endpoint.fill('');
+    await endpoint.press('Tab');
+    await expect(endpoint).toHaveValue('');
+    for (const address of [129, 130]) {
+      await expect(
+        trace.getByRole('button', { name: `Received · endpoint ${address}`, exact: true }),
+      ).toBeVisible();
+    }
+    await expect(endpoint).not.toHaveAttribute('aria-invalid', 'true');
+    await expect(
+      page.getByText('Enter a whole number from 0 to 255, or clear for all.', { exact: true }),
+    ).toHaveCount(0);
+    api.commandStatus = 503;
+    await page.getByRole('button', { name: 'Start', exact: true }).focus();
+    await page.keyboard.press('Enter');
+    await expect(page.getByRole('alert').filter({ hasText: 'queue full' })).toBeVisible();
+    await expect(
+      page.locator('[data-sonner-toast]').filter({ hasText: 'queue full' }),
+    ).toBeVisible();
+    expect(
+      await page.locator('body').evaluate((body) => body.scrollWidth <= window.innerWidth),
+    ).toBe(true);
+
+    expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
+  });
+}
+
+test('a rejected command from an old connection cannot overwrite the new session', async ({
+  page,
+  api,
+  appURL,
+}) => {
+  await page.goto(appURL);
+  const start = page.getByRole('button', { name: 'Start', exact: true });
+  await expect(start).toBeEnabled();
+  const release = api.holdCommand('start', 503);
+  await start.click();
+  await expect(start).toHaveAttribute('aria-busy', 'true');
+  await page.getByRole('button', { name: 'Disconnect', exact: true }).click();
+  await expect(
+    page.locator('[data-sonner-toast]').filter({ hasText: 'Disconnected.' }),
+  ).toBeVisible();
+  await page.getByRole('button', { name: 'Connect', exact: true }).click();
+  await expect(start).toBeEnabled();
+  release();
+  const polls = api.cursors.length;
+  await expect.poll(() => api.cursors.length).toBeGreaterThan(polls + 2);
+  await expect(page.getByRole('alert').filter({ hasText: 'queue full' })).toHaveCount(0);
+  await expect(page.locator('[data-sonner-toast]').filter({ hasText: 'queue full' })).toHaveCount(
+    0,
+  );
+  expect(api.commands.filter((command) => command === 'start')).toHaveLength(1);
 });

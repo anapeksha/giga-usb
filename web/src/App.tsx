@@ -11,6 +11,11 @@ import { Card, CardContent } from './components/ui/card';
 import { Topology, Hid } from './components/topology';
 import { Trace } from './components/trace';
 import { decodeSetup } from './lib/trace';
+import { Toaster } from './components/ui/sonner';
+import { Callout } from './components/ui/callout';
+import { Flex } from './components/ui/flex';
+import { Separator } from './components/ui/separator';
+import { Tooltip, TooltipTrigger, TooltipContent } from './components/ui/tooltip';
 
 export default function App() {
   const http = createHttpController();
@@ -32,15 +37,24 @@ export default function App() {
             <i />
             {http.connected() ? 'Connected' : 'Disconnected'}
           </span>
-          <Button onClick={() => void http.toggleConnection()}>
-            {http.busy() ? 'Cancel connection' : http.connected() ? 'Disconnect' : 'Connect'}
-          </Button>
+          <Tooltip>
+            <TooltipTrigger
+              as={Button}
+              loading={http.isLoading()}
+              onClick={() => void http.toggleConnection()}
+            >
+              {http.busy() ? 'Cancel connection' : http.connected() ? 'Disconnect' : 'Connect'}
+            </TooltipTrigger>
+            <TooltipContent>
+              Disconnecting leaves the USB host running. Use Stop to turn off USB-A power.
+            </TooltipContent>
+          </Tooltip>
         </div>
       </header>
 
       <Card>
         <CardContent class="p-5">
-          <div class="flex flex-wrap items-center justify-between gap-5">
+          <Flex class="flex-wrap gap-5">
             <div>
               <h2 class="text-base font-semibold">USB host</h2>
               <p class="mt-2 text-sm text-muted-foreground">
@@ -53,7 +67,13 @@ export default function App() {
                   <Button
                     variant="outline"
                     size="sm"
-                    disabled={!http.connected() || http.busy()}
+                    loading={http.isPending() && http.pendingCommand() === item.command}
+                    disabled={
+                      !http.connected() ||
+                      http.busy() ||
+                      http.isPending() ||
+                      (http.downloading() && item.command !== 'stop')
+                    }
                     onClick={() => void http.command(item.command)}
                   >
                     {item.label}
@@ -61,7 +81,8 @@ export default function App() {
                 )}
               </For>
             </div>
-          </div>
+          </Flex>
+          <Separator class="mt-5" />
           <dl class="status-grid">
             <div>
               <dt>Peripheral</dt>
@@ -88,10 +109,13 @@ export default function App() {
           </dl>
         </CardContent>
       </Card>
-      <div role="status" class="notice" classList={{ 'notice-error': http.notice().error }}>
-        {http.notice().message}
-      </div>
-      <section aria-label="Trace counters" class="mb-5 grid grid-cols-2 gap-3 lg:grid-cols-5">
+      <Show when={http.notice().error && http.notice().message}>
+        <Callout role="alert" aria-live="off" variant="error" class="my-4 text-sm">
+          {http.notice().message}
+        </Callout>
+      </Show>
+      <Toaster theme="dark" />
+      <section aria-label="Trace counters" class="my-5 grid grid-cols-2 gap-3 lg:grid-cols-5">
         <For
           each={
             [
@@ -179,8 +203,13 @@ export default function App() {
                 </AccordionItem>
               </Accordion>
               <Button
+                loading={http.isPending() && http.pendingCommand() === 'storage_list'}
                 disabled={
-                  !storage().fat32 || !http.connected() || !state().attached || http.downloading()
+                  !storage().fat32 ||
+                  !http.connected() ||
+                  !state().attached ||
+                  http.downloading() ||
+                  http.isPending()
                 }
                 onClick={() => {
                   void http.command('storage_list');
@@ -188,10 +217,14 @@ export default function App() {
               >
                 List files
               </Button>
-              <p role="status">{state().storageError}</p>
+              <Show when={state().storageError}>
+                <Callout variant="error" role="alert" class="my-3 text-sm">
+                  {state().storageError}
+                </Callout>
+              </Show>
               <For each={state().files}>
                 {(file) => (
-                  <div class="flex items-center justify-between gap-3 py-2">
+                  <div class="flex flex-wrap items-center justify-between gap-3 py-2 break-all">
                     <span>
                       {file.name} ·{' '}
                       {file.directory ? 'Folder' : `${file.size.toLocaleString()} bytes`}
@@ -199,11 +232,13 @@ export default function App() {
                     <Button
                       variant="outline"
                       aria-label={`Download ${file.name}`}
+                      loading={http.downloading() && http.downloadingFile() === file.index}
                       disabled={
                         file.directory ||
                         !state().attached ||
                         !http.connected() ||
-                        http.downloading()
+                        http.downloading() ||
+                        http.isPending()
                       }
                       onClick={() => http.download(file)}
                     >

@@ -35,17 +35,36 @@ const buttonVariants = cva(
 );
 
 type ButtonProps<T extends ValidComponent = 'button'> = ButtonPrimitive.ButtonRootProps<T> &
-  VariantProps<typeof buttonVariants> & { class?: string | undefined; children?: JSX.Element };
+  VariantProps<typeof buttonVariants> & {
+    class?: string | undefined;
+    children?: JSX.Element;
+    loading?: boolean;
+  };
 
 const Button = <T extends ValidComponent = 'button'>(
   props: PolymorphicProps<T, ButtonProps<T>>,
 ) => {
-  const [local, others] = splitProps(props as ButtonProps, ['variant', 'size', 'class']);
+  const [local, others] = splitProps(props as ButtonProps, [
+    'variant',
+    'size',
+    'class',
+    'loading',
+    'children',
+  ]);
   return (
     <ButtonPrimitive.Root
       class={cn(buttonVariants({ variant: local.variant, size: local.size }), local.class)}
       {...others}
-    />
+      aria-busy={local.loading || undefined}
+    >
+      {local.loading && (
+        <span
+          aria-hidden="true"
+          class="size-4 shrink-0 animate-spin rounded-full border-2 border-current border-r-transparent motion-reduce:animate-none"
+        />
+      )}
+      {local.children}
+    </ButtonPrimitive.Root>
   );
 };
 

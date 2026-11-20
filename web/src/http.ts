@@ -1,5 +1,6 @@
 import { createQuery, createMutation, useQueryClient } from '@tanstack/solid-query';
 import { createSignal, onCleanup, onMount } from 'solid-js';
+import { toast } from 'solid-sonner';
 import { appendFileChunk } from './lib/storage';
 import {
   createState,
@@ -25,7 +26,7 @@ export function createHttpController() {
   let state = { ...createState(), transportDropped: 0 };
   let cursor = 0;
   const listeners = new Set<(record: ProtocolRecord) => void>();
-  const [downloading, setDownloading] = createSignal(false);
+
   let session: AbortController | null = null;
   let refreshGuard = createLossRefreshGuard();
   const [sessionId, setSessionId] = createSignal(0);
@@ -34,26 +35,39 @@ export function createHttpController() {
   const [connected, setConnected] = createSignal(false);
   const [paused, setPaused] = createSignal(false);
   const [notice, setNotice] = createSignal({ message: 'Connecting to GIGA…', error: false });
-  const notify = (text: string, error = false) => setNotice({ message: text, error });
+  const notify = (text: string, error = false, announce = true) => {
+    setNotice({ message: text, error });
+    if (announce) {
+      if (error) toast.error(text);
+      else toast.success(text);
+    }
+  };
   const publish = () => setSnapshot({ ...state, history: [...state.history] });
 
   const command = createMutation(() => ({
     retry: false,
-    mutationFn: async ({ command, current }: { command: Command; current: AbortController }) => {
+    mutationFn: async ({
+      command,
+      current,
+    }: {
+      command: Command;
+      current: AbortController;
+      silent?: boolean;
+    }) => {
       await sendCommand(command, current.signal);
     },
-    onSuccess: (_, { current }) => {
-      if (session === current) notify(`Request accepted.`);
+    onSuccess: (_, { current, silent }) => {
+      if (session === current && !current.signal.aborted && !silent) notify('Request queued.');
     },
     onError: (error, { current }) => {
-      if (session === current) notify(message(error), true);
+      if (session === current && !current.signal.aborted) notify(message(error), true);
     },
   }));
   const refreshStatus = (current: AbortController) => {
-    if (!command.isPending) command.mutate({ command: 'status', current });
+    if (!command.isPending) command.mutate({ command: 'status', current, silent: true });
   };
 
-  createQuery(() => ({
+  const events = createQuery(() => ({
     queryKey: ['events', sessionId()],
     enabled: active(),
     retry: false,
@@ -113,7 +127,7 @@ export function createHttpController() {
     state = { ...createState(), transportDropped: 0 };
     setPaused(false);
     publish();
-    notify('Connecting to GIGA…');
+    notify('Connecting to GIGA…', false, false);
     setSessionId(++nextSession);
     setActive(true);
     // Status acceptance is independent of event polling, including on initial failure.
@@ -121,85 +135,99 @@ export function createHttpController() {
   }
   const download = createMutation(() => ({
     retry: false,
-    mutationFn: async (file: HostPayloads['file']) => {
-      const current = session;
-      const usbSession = state.session;
-      if (!current || !connected() || !state.attached) throw new Error('Device disconnected');
-      setDownloading(true);
+    mutationFn: async ({
+      file,
+      current,
+      usbSession,
+    }: {
+      file: HostPayloads['file'];
+      current: AbortController;
+      usbSession: number | null;
+    }) => {
+      if (current !== session || current.signal.aborted || !connected() || !state.attached)
+        throw new Error('Device disconnected');
       const chunks: number[] = [];
-      try {
-        do {
-          const offset = chunks.length;
-          // Events can arrive before POST resolves: install the listener first,
-          // then require both acceptance and the matching chunk before advancing.
-          const chunk = await new Promise<HostPayloads['file_data']>((resolve, reject) => {
-            let settled = false;
-            let accepted = false;
-            let received: HostPayloads['file_data'] | undefined;
-            const finish = (error?: Error, data?: HostPayloads['file_data']) => {
-              if (settled) return;
-              if (!error && data && !accepted) {
-                received = data;
-                return;
-              }
-              settled = true;
-              clearTimeout(timer);
-              listeners.delete(receive);
-              current.signal.removeEventListener('abort', abort);
-              if (error) reject(error);
-              else resolve(data!);
-            };
-            const abort = () => finish(new Error('Disconnected'));
-            const receive = (record: ProtocolRecord) => {
-              const p = record.event.type === 'host' ? hostEvent(record.event.event) : null;
-              if (record.event.type === 'error') finish(new Error(record.event.message));
-              if (
-                p?.[0] === 'detached' ||
-                p?.[0] === 'error' ||
-                (p?.[0] === 'lifecycle' &&
-                  (p[1].session_id !== usbSession ||
-                    ['stopped', 'waiting', 'error'].includes(p[1].state)))
-              )
-                finish(new Error('USB device unavailable'));
-              if (p?.[0] === 'storage_error') finish(new Error(p[1].message));
-              if (p?.[0] === 'file_data' && p[1].index === file.index && p[1].offset === offset)
-                finish(undefined, p[1]);
-            };
-            const timer = setTimeout(() => finish(new Error('File response timed out')), 10000);
-            listeners.add(receive);
-            current.signal.addEventListener('abort', abort, { once: true });
-            void sendCommand({ storage_read: { file: file.index, offset } }, current.signal)
-              .then(() => {
-                accepted = true;
-                if (received) finish(undefined, received);
-              })
-              .catch((error) => finish(new Error(message(error))));
-          });
-          if (appendFileChunk(file, chunks, chunk)) break;
-        } while (chunks.length < 65536);
-        const url = URL.createObjectURL(new Blob([new Uint8Array(chunks)]));
-        const link = document.createElement('a');
-        link.href = url;
-        link.download = file.name;
-        link.click();
-        setTimeout(() => URL.revokeObjectURL(url), 1000);
-        notify(chunks.length < file.size ? 'Downloaded first 64 KiB.' : 'Download complete.');
-      } finally {
-        setDownloading(false);
-      }
+      do {
+        const offset = chunks.length;
+        // Events can arrive before POST resolves: install the listener first,
+        // then require both acceptance and the matching chunk before advancing.
+        const chunk = await new Promise<HostPayloads['file_data']>((resolve, reject) => {
+          let settled = false;
+          let accepted = false;
+          let received: HostPayloads['file_data'] | undefined;
+          const finish = (error?: Error, data?: HostPayloads['file_data']) => {
+            if (settled) return;
+            if (!error && data && !accepted) {
+              received = data;
+              return;
+            }
+            settled = true;
+            clearTimeout(timer);
+            listeners.delete(receive);
+            current.signal.removeEventListener('abort', abort);
+            if (error) reject(error);
+            else resolve(data!);
+          };
+          const abort = () => finish(new Error('Disconnected'));
+          const receive = (record: ProtocolRecord) => {
+            const p = record.event.type === 'host' ? hostEvent(record.event.event) : null;
+            if (record.event.type === 'error') finish(new Error(record.event.message));
+            if (
+              p?.[0] === 'detached' ||
+              p?.[0] === 'error' ||
+              (p?.[0] === 'lifecycle' &&
+                (p[1].session_id !== usbSession ||
+                  ['stopped', 'waiting', 'error'].includes(p[1].state)))
+            )
+              finish(new Error('USB device unavailable'));
+            if (p?.[0] === 'storage_error') finish(new Error(p[1].message));
+            if (p?.[0] === 'file_data' && p[1].index === file.index && p[1].offset === offset)
+              finish(undefined, p[1]);
+          };
+          const timer = setTimeout(() => finish(new Error('File response timed out')), 10000);
+          listeners.add(receive);
+          current.signal.addEventListener('abort', abort, { once: true });
+          void sendCommand({ storage_read: { file: file.index, offset } }, current.signal)
+            .then(() => {
+              accepted = true;
+              if (received) finish(undefined, received);
+            })
+            .catch((error) => finish(new Error(message(error))));
+        });
+        if (appendFileChunk(file, chunks, chunk)) break;
+      } while (chunks.length < 65536);
+      const url = URL.createObjectURL(new Blob([new Uint8Array(chunks)]));
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = file.name;
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
     },
-    onError: (error: unknown) => notify(message(error), true),
+    onSuccess: (_, { current }) => {
+      if (session === current && !current.signal.aborted) notify('Download complete.');
+    },
+    onError: (error: unknown, { current }) => {
+      if (session === current && !current.signal.aborted) notify(message(error), true);
+    },
   }));
   onMount(connect);
   onCleanup(disconnect);
   return {
     snapshot,
-    downloading,
+    downloading: () => download.isPending,
+    downloadingFile: () => (download.isPending ? download.variables?.file.index : undefined),
     download: (file: HostPayloads['file']) => {
-      if (!downloading()) download.mutate(file);
+      if (session && !download.isPending && !command.isPending)
+        download.mutate({ file, current: session, usbSession: state.session });
     },
     connected,
     busy: () => active() && !connected(),
+    isLoading: () => active() && !connected() && events.isLoading,
+    isPending: () => command.isPending && command.variables?.current === session,
+    pendingCommand: () =>
+      command.isPending && command.variables?.current === session
+        ? command.variables.command
+        : undefined,
     paused,
     notice,
     toggleConnection: () => {
@@ -209,7 +237,7 @@ export function createHttpController() {
       } else connect();
     },
     command: (value: Command) => {
-      if (session && connected()) {
+      if (session && connected() && !command.isPending) {
         if (value === 'storage_list') {
           state.files = [];
           state.storageError = null;
