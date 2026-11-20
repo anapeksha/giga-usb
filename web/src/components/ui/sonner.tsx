@@ -17,6 +17,8 @@ const Toaster: Component<ToasterProps> = (props) => {
         '--normal-border': 'hsl(var(--border))',
       }}
       toastOptions={{
+        // Animate movement without fading text through low-contrast intermediate colors.
+        style: { 'transition-property': 'transform, height, box-shadow' },
         classes: {
           toast:
             'group toast group-[.toaster]:bg-background group-[.toaster]:text-foreground group-[.toaster]:border-border group-[.toaster]:shadow-lg focus-visible:outline-2 focus-visible:outline-ring focus-visible:outline-offset-2',
