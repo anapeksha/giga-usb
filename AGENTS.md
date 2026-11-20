@@ -443,10 +443,14 @@ must not be automatically retried. Trace filtering must not change USB schedulin
 retry, and window-focus refetching is disabled.
 
 Event queries use a fresh session key and retain the cursor, not pages of trace
-data. This prevents cache refetches from replaying records. Full three-record
-pages drain immediately; caught-up queries poll at 150 ms. Initial status failure
-does not block polling. Requests and response-body reads have eight-second
-deadlines. Cancel/disconnect aborts active work; stale responses are ignored.
+data. This prevents cache refetches from replaying records. Each query drains
+at most eight three-record pages, then returns to the 150 ms polling interval.
+Listeners receive records immediately; the dashboard publishes once per batch.
+Do not replace this with unbounded infinite-query page accumulation. Initial
+status failure does not block polling. Requests and response-body reads have
+eight-second deadlines. Cancel/disconnect aborts active work; stale responses
+are ignored. Queries and mutations use `networkMode: 'always'` so browser
+Internet-availability hints do not pause requests to the local AP.
 
 Commands are mutations: HTTP **202 means queued, not executed**. Completion must
 be observed in events. Queue-full/rejected commands report an error and are never
@@ -460,6 +464,14 @@ automatically retried. Contracts and queue limits are specified above; use the p
   or exports. Browser-local arrival sequence preserves original context/payload
   adjacency across omitted updates. Display is newest-first; JSON exports are
   oldest-first. Exports can contain sensitive input.
+- Trace rows use `@tanstack/solid-virtual` with dynamic height measurement and
+  stable sequence/transfer keys. Preserve the visible record offset when polling
+  prepends new records; fall back to a retained neighbor if that record is evicted.
+  Expansion state is bounded by retained history. Split large transfer groups
+  into bounded render rows without changing context association or exports.
+- Device details are height-bounded and keyboard-scrollable. Device identification
+  is an offline VID/PID/class inference or reported storage inquiry text, not
+  authenticated make/model detection. Label guesses and retain raw descriptors.
 - **Pause display** stops rendering, not reads or capture. **Clear trace** clears
   browser history only. Disconnect leaves history exportable; reconnect starts a
   fresh session and replays available board history.

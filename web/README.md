@@ -29,7 +29,10 @@ parsed input/descriptors, storage replies and unscoped processor errors still up
 dashboard state but do not consume trace history or appear in its JSON export.
 Exports are oldest-first. A browser-local `sequence` field counts all validated
 arrivals, including omitted records, to prevent false context/packet adjacency.
-Expanded packet details stay open while polling and when new records arrive.
+The virtualized table renders visible rows only and preserves your reading position
+as new records arrive. Expanded details stay open when scrolled out of view and back.
+Device details scroll within a bounded panel. Identification is labeled as a likely
+USB ID/class match or text reported by storage, not verified make/model detection.
 
 Components in `src/components/ui/` are source-copied from
 [solid-ui](https://www.solid-ui.com/docs) and adapted to the dark theme using
@@ -39,8 +42,10 @@ Persistent errors remain visible in callouts after the toast closes.
 
 Filter by endpoint, direction or transfer type, or search summaries, decoded
 requests and hex bytes. Filters do not change capture or exported history.
-The trace uses a semantic table; sorting and pagination are intentionally omitted
-to preserve transfer order and adjacent context.
+The trace uses a semantic table with `@tanstack/solid-virtual`. Display sorting and
+pagination are intentionally omitted to preserve transfer order and adjacent context.
+Event polling remains cursor-based: each query drains at most eight bounded pages
+before returning to its polling interval, without caching pages of trace history.
 
 ## Develop locally
 
