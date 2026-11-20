@@ -6,14 +6,11 @@ use picoserve::{
     Config, Router, Server, Timeouts,
     extract::{Json, Query},
     io::Write,
-    response::{Content, IntoResponse, Json as JsonResponse, Response, StatusCode, fs::File},
+    response::{Content, IntoResponse, Response, StatusCode, fs::File},
     routing::{get, get_service, post},
 };
 use serde::Deserialize;
-use shared::{
-    usb::types::CommandRequest,
-    wifi::{WifiControl, WifiRequest},
-};
+use shared::usb::types::CommandRequest;
 
 #[derive(Deserialize)]
 struct Cursor {
@@ -37,7 +34,7 @@ impl Content for Events {
     }
 }
 
-pub async fn serve(stack: Stack<'_>, bus: &Bus, wifi: &WifiControl) {
+pub async fn serve(stack: Stack<'_>, bus: &Bus) {
     let app =
         Router::new()
             .route(
@@ -47,17 +44,6 @@ pub async fn serve(stack: Stack<'_>, bus: &Bus, wifi: &WifiControl) {
                     include_bytes!("../../../dist/index.html.gz"),
                     &[("Content-Encoding", "gzip"), ("Cache-Control", "no-cache")],
                 )),
-            )
-            .route(
-                "/api/wifi",
-                get(move || async move {
-                    JsonResponse(wifi.state())
-                        .into_response()
-                        .with_header("Cache-Control", "no-store")
-                })
-                .post(move |Json(request): Json<WifiRequest>| async move {
-                    provision(wifi, request).await
-                }),
             )
             .route(
                 "/api/events",
@@ -85,28 +71,6 @@ pub async fn serve(stack: Stack<'_>, bus: &Bus, wifi: &WifiControl) {
     Server::new(&app, &config, &mut http)
         .listen_and_serve(0, stack, 80, &mut rx, &mut tx)
         .await;
-}
-
-async fn provision(wifi: &WifiControl, request: WifiRequest) -> impl IntoResponse {
-    let (status, body) = if request.validate().is_err() {
-        (
-            StatusCode::BAD_REQUEST,
-            "{\"error\":\"invalid SSID or password\"}",
-        )
-    } else if wifi.submit(request).is_err() {
-        (
-            StatusCode::CONFLICT,
-            "{\"error\":\"Wi-Fi provisioning is only available in setup mode\"}",
-        )
-    } else {
-        (StatusCode::ACCEPTED, "{\"accepted\":true}")
-    };
-    (
-        status,
-        ("Content-Type", "application/json"),
-        ("Cache-Control", "no-store"),
-        body,
-    )
 }
 
 async fn command(bus: &Bus, request: CommandRequest) -> impl IntoResponse {

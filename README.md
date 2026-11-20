@@ -15,7 +15,6 @@ Requires stable Rust, the `thumbv7em-none-eabihf` target and Node.js 24 LTS.
 From the repository root:
 
 ```sh
-
 (cd web && npm ci && npm run check)
 cargo build -p m4 --release --features defmt --locked
 cargo build -p m7 --release --features defmt --locked
@@ -38,26 +37,29 @@ probe-rs download --chip STM32H747XI --speed 1000 target/thumbv7em-none-eabihf/r
 probe-rs reset --chip STM32H747XI
 ```
 
-Verify programming and use a full system reset. Do not mass/chip erase: saved
-Wi-Fi credentials must survive ordinary sector-scoped updates. Recovery and
-CubeProgrammer instructions are in the [engineering guide](AGENTS.md#flash-log-and-debug).
+Verify programming and use a full system reset. Use sector-scoped flashing,
+not mass erase. Recovery and CubeProgrammer instructions are in the
+[engineering guide](AGENTS.md#flash-log-and-debug).
 
 ## Use
 
-1. Power the board normally. Without valid saved credentials, join **GigaUSB**
-   from a separate phone or laptop and open **http://192.168.4.1/**.
+1. Power the board normally. Join the open **GigaUSB** network from a separate
+   phone or laptop and open **http://192.168.4.1/**; DHCP is provided by the board.
 2. Connect a supported peripheral to **USB-A**, then click **Start**.
    **Never connect USB-A to another computer.** Respect the board's power limits.
 3. Inspect topology, input and traces. **Stop** disables the host;
    browser **Disconnect** only stops polling. Exports may contain sensitive input.
-4. Optionally enter router credentials in the Wi-Fi card. After the setup AP
-   closes, reconnect your client to the router and find the board's IP in its
-   DHCP leases. There is no automatic redirect or mDNS.
 
-Saved credentials are tried on boot; failed connections restore setup mode.
-Use a separate client for provisioning; do not change the development Mac's Wi-Fi.
-The AP is open, HTTP is unauthenticated and unencrypted, and stored credentials
-are plaintext. Use only in a trusted environment.
+Networking is AP-only: no router setup, password entry or credential saving.
+Do not change the development Mac's Wi-Fi; use a separate client for testing.
+The AP is open and HTTP is unauthenticated and unencrypted. Use a trusted environment.
+Old plaintext credentials may remain from historical firmware; removing the
+feature does not securely erase them. Do not mass erase for feature cleanup.
+
+**Known startup issue:** a confirmed cyw43 `Aligned`/`size_of_val` transfer-size
+overshoot causes an SDIO panic. An upstream fix is still needed; AP/HTTP operation
+is not yet validated for the current images. See the
+[engineering guide](AGENTS.md#known-sdio-startup-panic).
 
 For connection problems, LED meanings, support limits and dated validation
 results, see [AGENTS.md](AGENTS.md). For dashboard development commands, see

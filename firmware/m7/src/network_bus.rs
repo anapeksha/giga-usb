@@ -55,10 +55,6 @@ impl Bus {
         self.0.borrow().led
     }
 
-    pub fn set_saving(&self, saving: bool) {
-        self.0.borrow_mut().led.saving = saving;
-    }
-
     pub fn observe_host(&self, event: &UsbEvent, now_ms: u64) {
         self.0.borrow_mut().led.observe(event, now_ms);
     }
@@ -158,6 +154,33 @@ impl Bus {
 mod tests {
     use super::*;
     use shared::protocol::Event;
+    #[test]
+    fn ap_network_diagnostics_and_led_survive_status_requests() {
+        let bus = Bus::new();
+        let setup = NetworkInfo {
+            mode: String::try_from("setup").unwrap(),
+            mac: [2, 1, 2, 3, 4, 5],
+            ip: Some(String::try_from("192.168.4.1").unwrap()),
+            error: None,
+        };
+        bus.set_network(setup.clone());
+        assert_eq!(bus.led_snapshot().network, Some(NetworkMode::Setup));
+        assert!(bus.command(HostCommand::Status));
+        assert_eq!(bus.next_command(), Some(HostCommand::Status));
+        let current = bus.network().unwrap();
+        assert_eq!(current.mac, setup.mac);
+        assert_eq!(current.ip, setup.ip);
+        assert_eq!(current.mode, "setup");
+        bus.set_network(NetworkInfo {
+            mode: String::try_from("error").unwrap(),
+            mac: [0; 6],
+            ip: None,
+            error: Some(String::try_from("Wi-Fi SDIO startup failed").unwrap()),
+        });
+        assert_eq!(bus.led_snapshot().network, Some(NetworkMode::Error));
+        assert!(bus.network().unwrap().error.is_some());
+    }
+
     #[test]
     fn bounded_commands_overflow_recovery_and_wrap() {
         let bus = Bus::new();

@@ -15,10 +15,9 @@ pub mod logging;
 
 pub mod protocol;
 pub mod usb;
-pub mod wifi;
 
 pub const M4_FLASH_ORIGIN: u32 = 0x0810_0000;
-pub const M4_FLASH_END: u32 = 0x081c_0000;
+pub const M4_FLASH_END: u32 = 0x0820_0000;
 pub const M4_RAM_ORIGIN: u32 = 0x3000_0000;
 pub const M4_RAM_END: u32 = 0x3002_0000;
 

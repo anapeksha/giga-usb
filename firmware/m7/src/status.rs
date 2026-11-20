@@ -25,7 +25,6 @@ pub enum NetworkMode {
 pub struct Input {
     pub host: HostState,
     pub network: Option<NetworkMode>,
-    pub saving: bool,
     pub activity_ms: Option<u64>,
     session: u32,
     fault: bool,
@@ -42,7 +41,6 @@ impl Input {
         Self {
             host: HostState::Stopped,
             network: None,
-            saving: false,
             activity_ms: None,
             session: 0,
             fault: false,
@@ -86,9 +84,6 @@ pub fn select(input: &Input, now_ms: u64) -> Rgb {
     let phase = now_ms % 2000;
     if input.fault || input.network == Some(NetworkMode::Error) {
         return pulse(phase < 600 && phase % 200 < 100, Rgb::Red);
-    }
-    if input.saving {
-        return pulse(now_ms % 200 < 100, Rgb::Magenta);
     }
     if matches!(input.host, HostState::Attached | HostState::Enumerating) {
         return pulse(now_ms % 200 < 100, Rgb::Yellow);
@@ -164,9 +159,6 @@ mod tests {
         assert_eq!(select(&input, 0), Rgb::Cyan);
         lifecycle(&mut input, HostState::Enumerating, 1);
         assert_eq!(select(&input, 0), Rgb::Yellow);
-        input.saving = true;
-        assert_eq!(select(&input, 0), Rgb::Magenta);
-        assert_eq!(select(&input, 100), Rgb::Off);
         lifecycle(&mut input, HostState::Error, 1);
         for (time, expected) in [
             (0, Rgb::Red),
@@ -182,8 +174,7 @@ mod tests {
         lifecycle(&mut input, HostState::Enumerating, 1);
         assert_eq!(select(&input, 0), Rgb::Red);
         lifecycle(&mut input, HostState::Enumerating, 2);
-        assert_eq!(select(&input, 0), Rgb::Magenta);
-        input.saving = false;
+        assert_eq!(select(&input, 0), Rgb::Yellow);
         for state in [HostState::Ready, HostState::Waiting, HostState::Stopped] {
             lifecycle(&mut input, HostState::Error, 2);
             lifecycle(&mut input, state, 2);

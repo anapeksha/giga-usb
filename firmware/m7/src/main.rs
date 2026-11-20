@@ -47,7 +47,6 @@ async fn main(spawner: Spawner) {
     spawner.spawn(
         network::run(
             network::Pins {
-                flash: p.FLASH,
                 sdmmc: p.SDMMC1,
                 clock: p.PC12,
                 command: p.PD2,

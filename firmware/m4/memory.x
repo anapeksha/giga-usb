@@ -1,8 +1,6 @@
 MEMORY
 {
-  FLASH (rx)    : ORIGIN = 0x08100000, LENGTH = 768K
-  /* M7 owns these erase sectors; no M4 code or loadable data may use them. */
-  CREDENTIALS  : ORIGIN = 0x081C0000, LENGTH = 256K
+  FLASH (rx)    : ORIGIN = 0x08100000, LENGTH = 1024K
   RAM (rwx)     : ORIGIN = 0x30000000, LENGTH = 128K
   EMBASSY (rwx) : ORIGIN = 0x38000000, LENGTH = 1K
   MAILBOX (rwx) : ORIGIN = 0x38000400, LENGTH = 1K
@@ -22,10 +20,6 @@ SECTIONS
   } > MAILBOX
 }
 
-ASSERT(ORIGIN(FLASH) + LENGTH(FLASH) == ORIGIN(CREDENTIALS),
-       "M4 flash must end before credential storage");
-ASSERT(ORIGIN(CREDENTIALS) + LENGTH(CREDENTIALS) == 0x08200000,
-       "credential storage must occupy the last two bank-2 sectors");
 ASSERT(ADDR(.shared_hal) == ORIGIN(EMBASSY), "HAL metadata address mismatch");
 ASSERT(SIZEOF(.shared_hal) <= LENGTH(EMBASSY), "HAL metadata exceeds reservation");
 ASSERT(ADDR(.ipc_mailbox) == ORIGIN(MAILBOX), "IPC mailbox address mismatch");

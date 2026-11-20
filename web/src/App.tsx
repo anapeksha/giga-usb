@@ -4,7 +4,6 @@ import { Button } from './components/ui/button';
 import { Card, CardContent } from './components/ui/card';
 import { Topology, Hid } from './components/topology';
 import { Trace } from './components/trace';
-import { WifiSetup } from './components/wifi';
 import { decodeSetup } from './lib/trace';
 
 export default function App() {
@@ -32,7 +31,6 @@ export default function App() {
           </Button>
         </div>
       </header>
-      <WifiSetup />
       <Card>
         <CardContent class="p-5">
           <div class="flex flex-wrap items-center justify-between gap-5">
