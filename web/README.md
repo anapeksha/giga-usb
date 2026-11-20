@@ -40,12 +40,23 @@ Kobalte primitives. Notifications use `solid-sonner`. Buttons reflect TanStack
 query/mutation loading states; **Request queued** means acceptance, not execution.
 Persistent errors remain visible in callouts after the toast closes.
 
-Filter by endpoint, direction or transfer type, or search summaries, decoded
-requests and hex bytes. Filters do not change capture or exported history.
-The trace uses a semantic table with `@tanstack/solid-virtual`. Display sorting and
-pagination are intentionally omitted to preserve transfer order and adjacent context.
-Event polling remains cursor-based: each query drains at most eight bounded pages
-before returning to its polling interval, without caching pages of trace history.
+Filters and search run on the board, over its latest 64 retained records and new
+arrivals. They do not search older browser-only history or recover dropped records.
+Changing filters does not change capture, device state, storage replies or the
+unfiltered browser-history export. Resume and connect before changing filters.
+
+- **Endpoint** selects the full decimal endpoint address, not the device address:
+  `0` is EP0 OUT; `128` is EP0 IN.
+- **Direction** selects IN (device to board) or OUT (board to device).
+- **Transfer** selects control requests, interrupt traffic such as HID, or bulk
+  traffic such as storage. A missing transfer context is not guessed.
+- **Errors only** shows USB errors and diagnostics, with compatible context.
+- **Search** matches summaries, decoded requests and hex bytes. Search is limited
+  to 96 UTF-8 bytes.
+  The trace uses a semantic table with `@tanstack/solid-virtual`. Display sorting and
+  pagination are intentionally omitted to preserve transfer order and adjacent context.
+  Event polling remains cursor-based: each query drains at most eight bounded pages
+  before returning to its polling interval, without caching pages of trace history.
 
 ## Develop locally
 

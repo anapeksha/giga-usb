@@ -398,10 +398,28 @@ USB activity and on-board browser validation were not performed in this run.
 | `GET /` | — | Embedded HTML, `Content-Encoding: gzip`, `Cache-Control: no-cache`, ETag |
 | `POST /api/command` | `{command}` | 202 queued, 503 queue full |
 | `GET /api/events?after=0` | Wrapping `u32` cursor | `{records, cursor, dropped}` |
+| `GET /api/trace?after=0` | Cursor and optional trace filters | `{records:[{sequence,record}], cursor, dropped}` |
 
 JSON responses are uncompressed. Event responses use `Cache-Control: no-store`.
 Malformed/oversized request JSON is rejected; clients must not depend on
 picoserve’s diagnostic error-body text.
+
+`/api/trace` is an additive HTTP route; IPC/UI records and protocol version are
+unchanged. It scans at most the retained 64 board records and returns at most
+three USB matches in a 4096-byte response. Optional parameters are exact
+`endpoint` address (`u8`), `direction=in|out`, `kind=control|interrupt|bulk`,
+`errors=true|false`, and `q` (at most 96 decoded UTF-8 bytes, trimmed,
+ASCII-case-insensitive). Invalid parameters return 400. Search includes record
+summaries, typed diagnostic fields, SETUP request names and hex bytes. An empty
+SETUP on an idle/non-control diagnostic is not decoded as a request.
+
+Server filtering preserves immediately adjacent compatible context/payload pairs,
+including across page boundaries. Each match carries its original wrapping `u32`
+sequence; exclusions advance the cursor without counting as loss or inventing
+new adjacency. Generic errors without endpoint/kind metadata cannot satisfy those
+scoped filters. Filtered-query `dropped` is a separate latest loss snapshot of
+unavailable board records, not necessarily matching USB records; never combine it
+with host or canonical event-stream counters.
 
 Commands use serde's externally tagged representation:
 
@@ -499,9 +517,18 @@ automatically retried. Contracts and queue limits are specified above; use the p
   fresh session and replays available board history.
 - Endpoints belong to an interface/alternate setting. Partial topology remains
   inspectable after failure; a new device session clears stale state.
-- Filters select endpoint (decimal address), direction, transfer kind or errors.
-  Context/payload records are associated only when adjacent and compatible, then
-  grouped by session/transfer ID. Missing context is not guessed.
+- Filters and search run on M7 through an independent `/api/trace` cursor query,
+  not by matching browser history. Canonical `/api/events` continues unfiltered
+  for dashboard state, storage listeners and full-history exports. Changing filters
+  resets only the filtered cursor/history, cancels stale requests, and debounces
+  search by 200 ms. Filtered history is bounded to 500 records; queries use the
+  same eight-page batch budget. Searches cover retained board history, not older
+  browser-only records. Filters are disabled while paused or disconnected.
+- Endpoint filters match the full decimal address exactly (`0` differs from
+  `128`); IN is device-to-host, OUT is host-to-device. Control, interrupt and bulk
+  filter the transfer kind when context provides it; missing context is not
+  guessed. Only originally adjacent compatible context/payload records associate,
+  including wrapping server sequence IDs, then group by session/transfer ID.
 - SETUP decoding covers standard and HID/MSC requests. Expanded records show raw
   bytes, PID, timing/retries and failure snapshots. These are completed host-side
   transfers, not passive wire capture, handshakes, CRCs or bus timing.
