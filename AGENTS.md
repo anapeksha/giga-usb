@@ -360,7 +360,14 @@ HTTP transfer, browser rendering and sustained AP traffic remain NOT RUN.
 A later USB endpoint `0x82` controller fault was observed; a short Start/Stop
 retry enumerated the receiver without a new error, but the original fault remains
 unresolved. Evidence is under `target/red-led-diagnostics.jsonl` and
-`target/usb-red-led-retry.jsonl`. The latest UI changes have not been flashed.
+`target/usb-red-led-retry.jsonl`.
+
+Images built from `3a1aa13`, including the solid-ui USB-only dashboard and the
+halt-deadline state recheck, were subsequently flashed M4 then M7, verified and
+system-reset. USB-C status reported AP mode at `192.168.4.1`, no network error,
+zero USB errors and the host stopped. Evidence is in
+`target/latest-flash-status.jsonl`. This startup check does not validate USB
+activity, on-board HTTP transfer/browser rendering or resolve the earlier fault.
 
 ### Routes
 
