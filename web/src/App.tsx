@@ -15,6 +15,7 @@ import { Toaster } from './components/ui/sonner';
 import { Callout } from './components/ui/callout';
 import { Flex } from './components/ui/flex';
 import { Separator } from './components/ui/separator';
+import { Skeleton } from './components/ui/skeleton';
 import { Tooltip, TooltipTrigger, TooltipContent } from './components/ui/tooltip';
 
 export default function App() {
@@ -35,7 +36,7 @@ export default function App() {
         <div class="flex items-center gap-4">
           <span class="transport" classList={{ online: http.connected() }}>
             <i />
-            {http.connected() ? 'Connected' : 'Disconnected'}
+            {http.busy() ? 'Connecting' : http.connected() ? 'Connected' : 'Disconnected'}
           </span>
           <Tooltip>
             <TooltipTrigger
@@ -83,28 +84,71 @@ export default function App() {
             </div>
           </Flex>
           <Separator class="mt-5" />
-          <dl class="status-grid">
+          <Show when={http.isLoading()}>
+            <span class="sr-only" role="status">
+              Loading status
+            </span>
+          </Show>
+          <dl class="status-grid" aria-label="USB host status" aria-busy={http.isLoading()}>
             <div>
               <dt>Peripheral</dt>
               <dd>
-                {!http.connected()
-                  ? 'Connect to view'
-                  : state().attached
-                    ? `Attached${state().speed ? ` · ${state().speed} speed` : ''}`
-                    : 'No device reported'}
+                <Show
+                  when={!http.isLoading()}
+                  fallback={
+                    <Skeleton
+                      aria-hidden="true"
+                      height={20}
+                      width={144}
+                      class="max-w-full rounded"
+                    />
+                  }
+                >
+                  {!http.connected()
+                    ? 'Connect to view'
+                    : state().attached
+                      ? `Attached${state().speed ? ` · ${state().speed} speed` : ''}`
+                      : 'No device reported'}
+                </Show>
               </dd>
             </div>
             <div>
               <dt>Host</dt>
               <dd>
-                {state().lifecycle
-                  ? state().lifecycle!.charAt(0).toUpperCase() + state().lifecycle!.slice(1)
-                  : 'Unknown'}
+                <Show
+                  when={!http.isLoading()}
+                  fallback={
+                    <Skeleton
+                      aria-hidden="true"
+                      height={20}
+                      width={96}
+                      class="max-w-full rounded"
+                    />
+                  }
+                >
+                  {state().lifecycle
+                    ? state().lifecycle!.charAt(0).toUpperCase() + state().lifecycle!.slice(1)
+                    : 'Unknown'}
+                </Show>
               </dd>
             </div>
             <div>
               <dt>Address</dt>
-              <dd>{state().address ?? '—'}</dd>
+              <dd>
+                <Show
+                  when={!http.isLoading()}
+                  fallback={
+                    <Skeleton
+                      aria-hidden="true"
+                      height={20}
+                      width={48}
+                      class="max-w-full rounded"
+                    />
+                  }
+                >
+                  {state().address ?? '—'}
+                </Show>
+              </dd>
             </div>
           </dl>
         </CardContent>
@@ -115,7 +159,11 @@ export default function App() {
         </Callout>
       </Show>
       <Toaster theme="dark" />
-      <section aria-label="Trace counters" class="my-5 grid grid-cols-2 gap-3 lg:grid-cols-5">
+      <section
+        aria-label="Trace counters"
+        aria-busy={http.isLoading()}
+        class="my-5 grid grid-cols-2 gap-3 lg:grid-cols-5"
+      >
         <For
           each={
             [
@@ -147,7 +195,20 @@ export default function App() {
               <CardContent class="p-4">
                 <p class="text-xs text-muted-foreground">{counter.label}</p>
                 <p class="my-2 font-mono text-2xl tabular-nums">
-                  {state()[counter.key].toLocaleString()}
+                  <Show
+                    when={!http.isLoading()}
+                    fallback={
+                      <Skeleton
+                        as="span"
+                        aria-hidden="true"
+                        height={32}
+                        width={80}
+                        class="block max-w-full rounded"
+                      />
+                    }
+                  >
+                    {state()[counter.key].toLocaleString()}
+                  </Show>
                 </p>
               </CardContent>
             </Card>

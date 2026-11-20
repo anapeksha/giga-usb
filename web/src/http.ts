@@ -45,6 +45,7 @@ export function createHttpController() {
   const publish = () => setSnapshot({ ...state, history: [...state.history] });
 
   const command = createMutation(() => ({
+    networkMode: 'always',
     retry: false,
     mutationFn: async ({
       command,
@@ -70,6 +71,7 @@ export function createHttpController() {
   const events = createQuery(() => ({
     queryKey: ['events', sessionId()],
     enabled: active(),
+    networkMode: 'always',
     retry: false,
     gcTime: 0,
     staleTime: 0,
@@ -84,17 +86,22 @@ export function createHttpController() {
         do {
           const page = await getEventPage(cursor, signal);
           if (session !== current || current.signal.aborted) throw new Error('Disconnected');
+          if (
+            page.records.some(
+              (record) =>
+                record.event.type === 'hello' && record.event.protocol_version !== PROTOCOL_VERSION,
+            )
+          )
+            throw new Error(
+              'Board software is incompatible with this app. Update the board and app together.',
+            );
           cursor = page.cursor;
           applyEventPage(state, page);
           for (const record of page.records) for (const listener of listeners) listener(record);
-          setConnected(true);
-          if (notice().message === 'Connecting to GIGA…') notify('Connected.');
-          for (const record of page.records) {
-            if (record.event.type === 'hello' && record.event.protocol_version !== PROTOCOL_VERSION)
-              notify(
-                'Board software is incompatible with this app. Update the board and app together.',
-                true,
-              );
+          if (!connected()) {
+            setConnected(true);
+            toast.success('Connected.');
+            if (!notice().error) notify('Connected.', false, false);
           }
           if (refreshGuard(page.dropped)) refreshStatus(current);
           if (!paused()) publish();
@@ -134,6 +141,7 @@ export function createHttpController() {
     refreshStatus(current);
   }
   const download = createMutation(() => ({
+    networkMode: 'always',
     retry: false,
     mutationFn: async ({
       file,

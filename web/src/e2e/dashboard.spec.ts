@@ -63,9 +63,119 @@ test('connecting can be cancelled while requests are pending', async ({ page, ap
   await cancel.click();
   await expect(page.getByRole('button', { name: 'Connect', exact: true })).toBeVisible();
   await expect(page.locator('[data-sonner-toast]')).toHaveText('Disconnected.');
+  for (const region of [
+    page.getByLabel('USB host status', { exact: true }),
+    page.getByRole('region', { name: 'Trace counters' }),
+  ]) {
+    await expect(region).toHaveAttribute('aria-busy', 'false');
+    await expect(region.locator('[aria-hidden="true"]')).toHaveCount(0);
+  }
   api.pending = false;
   await page.getByRole('button', { name: 'Connect', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Disconnect', exact: true })).toBeVisible();
+});
+
+for (const status of [202, 503]) {
+  test(`status ${status} leaves connection loading until the first event page`, async ({
+    page,
+    api,
+    appURL,
+  }) => {
+    api.commandStatus = status;
+    const release = api.holdEvents();
+    await page.goto(appURL);
+    await expect.poll(() => api.commands).toEqual(['status']);
+    await expect.poll(() => api.cursors.length).toBe(1);
+    const host = page.getByLabel('USB host status', { exact: true });
+    const counters = page.getByRole('region', { name: 'Trace counters' });
+    const connected = page.locator('[data-sonner-toast]').filter({ hasText: /^Connected\.$/ });
+    await expect(page.getByRole('button', { name: 'Cancel connection' })).toHaveAttribute(
+      'aria-busy',
+      'true',
+    );
+    await expect(page.getByText('Connecting', { exact: true })).toBeVisible();
+    for (const region of [host, counters]) {
+      await expect(region).toHaveAttribute('aria-busy', 'true');
+      await expect(region.locator('[aria-hidden="true"]').first()).toBeVisible();
+    }
+    await expect(connected).toHaveCount(0);
+    if (status === 503) {
+      await expect(
+        page.locator('[data-sonner-toast]').filter({ hasText: 'queue full' }),
+      ).toBeVisible();
+      await expect(host).toHaveAttribute('aria-busy', 'true');
+    }
+    release();
+    const disconnect = page.getByRole('button', { name: 'Disconnect', exact: true });
+    await expect(disconnect).toBeVisible();
+    await expect(disconnect).not.toHaveAttribute('aria-busy', 'true');
+    for (const region of [host, counters]) {
+      await expect(region).toHaveAttribute('aria-busy', 'false');
+      await expect(region.locator('[aria-hidden="true"]')).toHaveCount(0);
+    }
+    await expect(connected).toHaveCount(1);
+    const polls = api.cursors.length;
+    await expect.poll(() => api.cursors.length).toBeGreaterThan(polls + 2);
+    await expect(connected).toHaveCount(1);
+  });
+}
+
+for (const failure of ['events unavailable', 'incompatible hello', 'request deadline']) {
+  test(`${failure} clears initial loading without reporting connection success`, async ({
+    page,
+    api,
+    appURL,
+  }) => {
+    if (failure === 'events unavailable') api.eventsStatus = 503;
+    if (failure === 'incompatible hello') api.emit({ type: 'hello', protocol_version: 0 });
+    if (failure === 'request deadline') api.pending = true;
+    await page.goto(appURL);
+    if (failure === 'request deadline') {
+      await expect(page.getByRole('button', { name: 'Cancel connection' })).toHaveAttribute(
+        'aria-busy',
+        'true',
+      );
+    }
+    const connect = page.getByRole('button', { name: 'Connect', exact: true });
+    await expect(connect).toBeVisible({ timeout: 12000 });
+    await expect(connect).toBeEnabled();
+    await expect(connect).not.toHaveAttribute('aria-busy', 'true');
+    for (const region of [
+      page.getByLabel('USB host status', { exact: true }),
+      page.getByRole('region', { name: 'Trace counters' }),
+    ]) {
+      await expect(region).toHaveAttribute('aria-busy', 'false');
+      await expect(region.locator('[aria-hidden="true"]')).toHaveCount(0);
+    }
+    await expect(page.locator('[data-sonner-toast]').last()).toBeVisible();
+    await expect(page.getByRole('alert')).toBeVisible();
+    await expect(
+      page.locator('[data-sonner-toast]').filter({ hasText: /^Connected\.$/ }),
+    ).toHaveCount(0);
+    await expect(page.getByText('Connecting', { exact: true })).toHaveCount(0);
+  });
+}
+
+test('browser offline events do not pause local AP commands or reconnection', async ({
+  page,
+  api,
+  appURL,
+}) => {
+  await page.goto(appURL);
+  await expect(page.getByRole('button', { name: 'Disconnect', exact: true })).toBeVisible();
+  await page.evaluate(() => window.dispatchEvent(new Event('offline')));
+  await page.getByRole('button', { name: 'Start', exact: true }).click();
+  await expect.poll(() => api.commands.includes('start')).toBe(true);
+  await page.getByRole('button', { name: 'Disconnect', exact: true }).click();
+  const polls = api.cursors.length;
+  const statuses = api.commands.filter((command) => command === 'status').length;
+  await page.getByRole('button', { name: 'Connect', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Disconnect', exact: true })).toBeVisible();
+  await expect.poll(() => api.cursors.length).toBeGreaterThan(polls);
+  await expect
+    .poll(() => api.commands.filter((command) => command === 'status').length)
+    .toBe(statuses + 1);
+  await page.evaluate(() => window.dispatchEvent(new Event('online')));
 });
 
 test('trace filters decode fixture records; reconnect resets cursor without replay duplicates', async ({

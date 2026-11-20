@@ -11,6 +11,8 @@ export const test = base.extend<
       commands: Command[];
       cursors: number[];
       commandStatus: number;
+      eventsStatus: number;
+      holdEvents: () => () => void;
       holdCommand: (command: Command, status?: number) => () => void;
       pending: boolean;
       malformed: boolean;
@@ -49,11 +51,26 @@ export const test = base.extend<
   api: async ({ page }, use) => {
     const releases = new Set<() => void>();
     let held: { command: Command; status: number; wait: Promise<void> } | undefined;
+    let heldEvents: Promise<void> | undefined;
     const api = {
       records: [] as ProtocolRecord[],
       commands: [] as Command[],
       cursors: [] as number[],
       commandStatus: 202,
+      eventsStatus: 200,
+      holdEvents() {
+        let release!: () => void;
+        heldEvents = new Promise<void>((resolve) => {
+          const timer = setTimeout(() => release(), 5000);
+          release = () => {
+            clearTimeout(timer);
+            releases.delete(release);
+            resolve();
+          };
+        });
+        releases.add(release);
+        return release;
+      },
       holdCommand(command: Command, status = 202) {
         let release!: () => void;
         const wait = new Promise<void>((resolve) => {
@@ -92,6 +109,13 @@ export const test = base.extend<
       } else if (url.pathname === '/api/events') {
         const after = Number(url.searchParams.get('after'));
         api.cursors.push(after);
+        const gate = heldEvents;
+        heldEvents = undefined;
+        if (gate) await gate;
+        if (api.eventsStatus !== 200) {
+          await route.fulfill({ status: api.eventsStatus });
+          return;
+        }
         const records = api.records.slice(after, after + 3);
         await route.fulfill({
           json: api.malformed
