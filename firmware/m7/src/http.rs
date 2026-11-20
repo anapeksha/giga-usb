@@ -53,6 +53,15 @@ pub async fn serve(stack: Stack<'_>, bus: &Bus) {
                 }),
             )
             .route(
+                "/api/trace",
+                get(
+                    move |Query(query): Query<m7::trace_query::TraceQuery>| async move {
+                        Response::ok(Events(bus.trace(&query)))
+                            .with_header("Cache-Control", "no-store")
+                    },
+                ),
+            )
+            .route(
                 "/api/command",
                 post(move |Json(request): Json<CommandRequest>| async move {
                     command(bus, request).await

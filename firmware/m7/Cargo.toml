@@ -20,6 +20,7 @@ postcard.workspace = true
 shared.workspace = true
 heapless.workspace = true
 serde.workspace = true
+serde-json-core.workspace = true
 embassy-net-driver = "0.2.0"
 
 [target.'cfg(target_os = "none")'.dependencies]
@@ -37,6 +38,3 @@ leasehund.workspace = true
 picoserve.workspace = true
 giga-r1 = { workspace = true, features = ["wifi"] }
 static_cell.workspace = true
-
-[dev-dependencies]
-serde-json-core.workspace = true

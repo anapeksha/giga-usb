@@ -6,4 +6,5 @@ pub mod ap_driver;
 pub mod boot;
 pub mod network_bus;
 pub mod status;
+pub mod trace_query;
 pub mod usb;
