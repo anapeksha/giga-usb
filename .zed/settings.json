@@ -1,0 +1,63 @@
+{
+  "languages": {
+    "Rust": {
+      "format_on_save": "on"
+    }
+  },
+  "lsp": {
+    "rust-analyzer": {
+      "binary": {
+        "ignore_system_version": true
+      },
+      "initialization_options": {
+        "cargo": {
+          "target": "thumbv7em-none-eabihf",
+          "targetDir": "target/rust-analyzer",
+          "allTargets": false,
+          "buildScripts": {
+            "enable": true,
+            "overrideCommand": [
+              "cargo",
+              "check",
+              "--package",
+              "m7",
+              "--target",
+              "thumbv7em-none-eabihf",
+              "--target-dir",
+              "target/rust-analyzer",
+              "--message-format=json",
+              "--locked"
+            ]
+          }
+        },
+        "check": {
+          "allTargets": false,
+          "overrideCommand": [
+            "cargo",
+            "clippy",
+            "--package",
+            "m7",
+            "--target",
+            "thumbv7em-none-eabihf",
+            "--target-dir",
+            "target/rust-analyzer",
+            "--message-format=json",
+            "--locked",
+            "--",
+            "-D",
+            "warnings"
+          ]
+        },
+        "cfg": {
+          "setTest": false
+        },
+        "procMacro": {
+          "enable": true
+        },
+        "linkedProjects": [
+          "Cargo.toml"
+        ]
+      }
+    }
+  }
+}

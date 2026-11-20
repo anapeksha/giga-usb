@@ -1,0 +1,12 @@
+[
+  {
+    "label": "M7: attach to cargo-embed server",
+    "adapter": "CodeLLDB",
+    "request": "attach",
+    "program": "$ZED_WORKTREE_ROOT/target/thumbv7em-none-eabihf/release/m7",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "sourceLanguages": ["rust"],
+    "processCreateCommands": ["gdb-remote 127.0.0.1:1337"],
+    "stopOnEntry": true
+  }
+]

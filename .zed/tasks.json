@@ -1,0 +1,9 @@
+[
+  {
+    "label": "Debug: start cargo-embed server (M7)",
+    "command": "cargo",
+    "args": ["embed", "debug", "-p", "m7", "--release", "--features", "defmt"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "allow_concurrent_runs": false
+  }
+]

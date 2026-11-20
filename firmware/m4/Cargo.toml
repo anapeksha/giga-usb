@@ -1,0 +1,37 @@
+[package]
+name = "m4"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "m4"
+path = "src/main.rs"
+
+[features]
+default = []
+defmt = ["shared/defmt", "dep:defmt-rtt", "embassy-stm32/defmt", "embassy-time/defmt"]
+
+[lints]
+workspace = true
+
+[dependencies]
+shared.workspace = true
+heapless.workspace = true
+
+[target.'cfg(target_os = "none")'.dependencies]
+
+cortex-m-rt.workspace = true
+panic-halt.workspace = true
+embassy-executor.workspace = true
+embassy-stm32 = { workspace = true, features = ["stm32h747xi-cm4", "time-driver-tim5"] }
+embassy-time.workspace = true
+embassy-usb.workspace = true
+serde-json-core.workspace = true
+static_cell.workspace = true
+embassy-futures.workspace = true
+
+defmt-rtt = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde-json-core.workspace = true

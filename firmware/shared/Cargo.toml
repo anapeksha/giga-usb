@@ -1,0 +1,25 @@
+[package]
+name = "shared"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+defmt = ["dep:defmt"]
+
+[lints]
+workspace = true
+
+[dependencies]
+defmt = { workspace = true, optional = true }
+serde.workspace = true
+postcard.workspace = true
+heapless.workspace = true
+giga-r1.workspace = true
+
+[target.'cfg(target_os = "none")'.dependencies]
+embassy-stm32.workspace = true
+
+[dev-dependencies]
+# Golden JSON and record-size tests use the same serializer as the firmware.
+serde-json-core.workspace = true

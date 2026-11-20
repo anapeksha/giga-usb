@@ -1,0 +1,723 @@
+# GigaUSB engineering guide
+
+## Purpose
+
+GigaUSB is a bare-metal Rust USB host and diagnostic tool for the Arduino GIGA
+R1 WiFi (STM32H747XI). Build the host controller driver and USB protocol stack
+here. Do not replace them with an existing USB host stack.
+
+Capture means observing traffic initiated by this board. This hardware and
+firmware cannot passively sniff the link between two external USB devices.
+Do not describe completed host transactions as wire-level packet capture:
+handshakes, CRCs, bus timing and arbitrary external traffic are not captured.
+
+## Workspace and ownership
+
+- Keep one Cargo workspace: `firmware/m7`, `firmware/m4`, `firmware/shared`.
+- M7 owns USB-A host control, scheduling, capture, Wi-Fi and HTTP.
+- M4 owns descriptor/HID processing and secondary USB-C CDC diagnostics.
+- Shared contains only protocol, IPC, logging and Wi-Fi contracts, USB types,
+  and shared HAL metadata. Its only feature is `defmt`; there are no `m7`/`m4`
+  selectors.
+- M7's native-testable library owns `firmware/m7/src/{credentials,status,network_bus}.rs`
+  and `firmware/m7/src/usb/{host,host_logic,host_storage,storage}.rs`.
+  `firmware/m7/src/boot.rs` owns M7-specific boot coordination and M4 validation.
+- M4's native-testable library owns `firmware/m4/src/usb/{processor,hid}.rs`;
+  `firmware/m4/src/boot.rs` owns M4-specific boot adoption.
+- M7 owns USB_OTG_HS with its internal full-speed PHY, PB14/PB15, PA15 VBUS,
+  SDMMC1, PB10, PC8–PC12/PD2, RGB LED PI12/PJ13/PE3 and TIM2.
+- M4 owns USB_OTG_FS, PA11/PA12 and TIM5. Never access one controller from both cores.
+- Embassy provides cooperative executors, timers, HAL support and USB device
+  transport. `giga-r1` provides board Wi-Fi support, IPC queues and MPU setup.
+- Both applications forbid unsafe code. M7 uses safe typed PAC access rather
+  than raw MMIO. Keep peripheral ownership explicit; do not move core-specific
+  hardware access into shared.
+- Shared HAL metadata remains genuinely shared. Preserve its required linker
+  attributes and the shared-memory reservations.
+
+## Builds and tooling
+
+Use stable Rust and `thumbv7em-none-eabihf`. Build/check each core separately;
+Cargo cannot unify the CM7 and CM4 HAL chip features. Never use `--workspace`
+or `--all-features` for firmware builds. Keep hardware dependencies behind safe
+ownership boundaries; shared has no core-selector features.
+`defmt` is the only optional application behavior. Logging is centralized in
+`shared::logging` and calls a no-op when disabled. Never log credentials.
+
+Build the web bundle before M7; firmware uses `include_bytes!` on
+`dist/index.html.gz`. Production firmware uses release builds; debug firmware
+can exceed flash capacity. Preserve the single-file gzip build and serve it as
+HTML with `Content-Encoding: gzip`. Keep JSON endpoints uncompressed unless an
+explicit implementation and tests are added.
+
+```sh
+(cd web && npm ci && npm run check)
+cargo fmt --all -- --check
+cargo clippy -p m7 --release --features defmt --locked -- -D warnings
+cargo clippy -p m4 --release --features defmt --locked -- -D warnings
+cargo test -p shared --target aarch64-apple-darwin --lib --locked
+cargo test -p m7 --target aarch64-apple-darwin --lib --locked
+cargo test -p m4 --target aarch64-apple-darwin --lib --locked
+cargo build -p m4 --release --features defmt --locked
+cargo build -p m7 --release --features defmt --locked
+```
+
+The host test target above is for Apple silicon; use the actual host target on
+other machines. Keep the lockfiles reproducible. Also check logging-disabled
+firmware when changing dependencies or the logging facade.
+
+Zed uses its managed rust-analyzer. Package-specific compiler checks are required;
+full HAL semantic analysis still has a Cargo workspace metadata feature-unification
+limitation. Do not hide diagnostics or silently split the workspace. Keep only
+the cargo-embed server task; CodeLLDB attaches to its GDB endpoint. Cargo-embed
+is a GDB server, not a DAP server.
+
+## Boot, memory and flashing
+
+- M7 flash: `0x08000000`, 1 MiB; private AXI SRAM: `0x24000000`, 512 KiB.
+- M4 flash: `0x08100000`, 768 KiB, ending at `0x081C0000`; private SRAM1:
+  `0x30000000`, 128 KiB. M7's M4 boot validation must exclude credentials.
+- Credential flash: `0x081C0000..0x08200000`, last two 128-KiB bank-2 sectors,
+  exclusive M7 runtime ownership, plaintext storage via `sequential-storage` 8.0.2.
+  No loadable sections may occupy it. Ordinary sector-scoped firmware updates
+  must preserve it; mass/chip erase removes credentials.
+- Bank-2 write/erase can stall M4 instruction fetches; async APIs do not eliminate
+  this. Validate concurrent USB/network continuity; do not promise M4 quiescence.
+- SRAM4 HAL metadata: `0x38000000`, 1 KiB.
+- SRAM4 IPC: `0x38000400`, 1 KiB.
+- Each core's `memory.x` defines shared NOLOAD sections directly. Do not add
+  `shared.x` or insert shared sections after private BSS/uninitialized sections.
+- Preserve linker assertions keeping runtime RAM boundaries private.
+- BCM7=1, BCM4=0, boot bases M7=`0x08000000`, M4=`0x08100000`, SWAP_BANK=0.
+  M7 initializes clocks, HAL metadata and IPC before releasing M4.
+- Boot addresses reference vector tables, not entry functions. Use system resets,
+  not core-only resets, after flashing. Match both firmware versions and schemas.
+- M7 currently runs at 400 MHz; AHB/M4 at 200 MHz. Data cache is disabled;
+  shared SRAM is non-cacheable. HSEM alone would not provide cache coherency.
+- Flash M4 then M7, verify, and perform a full reset. Updating M7 overwrites the
+  Arduino bootloader. Do not mass erase or change option bytes casually.
+- Use the stock STM32H747XI probe-rs target. If attachment fails while M4 remains
+  held, recover with CubeProgrammer connect-under-reset, not custom chip YAML.
+- Only one debugger can own ST-LINK. Identify and release the existing session
+  before flashing; do not kill unrelated processes.
+
+## USB correctness and tracing
+
+The current host is timer-polled, non-DMA, one root device and one active channel.
+Enumeration selects the first configuration. Supported transfers include
+control reads/no-data requests, up to four HID
+interfaces and experimental read-only BOT/SCSI storage. Descriptor storage is
+bounded to 1024 bytes. HID supports boot keyboard/mouse and a bounded non-boot
+subset with report IDs and relative axes: 64 fields total per layout across at
+most eight reports, not arbitrary HID interpretation.
+Storage supports LUN 0, 512-byte sectors, FAT32 MBR/superfloppy, root 8.3 aliases,
+at most 32 entries and files up to 64 KiB. Root scanning is capped at 32 sectors,
+chain traversal at 128 distinct clusters. No writes or formatting. Historical
+receiver evidence is recorded below; non-boot semantic input and real storage
+remain NOT RUN. Historical evidence does not validate current images.
+Hubs, general composite/class support, arbitrary HID/absolute-axis layouts,
+writable storage, subdirectory traversal, LFN decoding, other filesystems,
+multi-LUN, CDC-host and isochronous transfers remain future work.
+
+- Start controls USB-A power; leave VBUS off until explicitly requested.
+- Never connect the USB-A host port to another computer.
+- Keep control SETUP/data/status sequencing and data toggles explicit.
+- Drain RX status before treating completion as terminal. XFRC with pending RX
+  is not a transaction error just because CHHLTD is also set.
+- Configure directly attached low-speed channels using the root-port rules, not
+  low-speed-behind-hub rules. Preserve W1C handling in HPRT and channel status.
+- Every hardware wait must have a deadline and yield to other executor tasks.
+- Trace successful packets with exact bytes and PID; do not invent captures or
+  flood bounded queues with every NAK retry. Report drops instead of blocking USB.
+- Diagnose blank topology from real enumeration events/errors before changing
+  descriptor rendering. A connected browser does not prove USB enumeration.
+- Add tests for parsers, malformed descriptors, packet lengths and channel outcomes.
+- Preserve partial topology and stage/session/transfer diagnostics after failure;
+  clear stale context on a new session. Trace filtering must not alter host work.
+- Validate storage with known small and already fragmented files and checksums,
+  using read-only workflows. Never destructively format a user's disk or modify
+  it to manufacture fragmentation; unavailable specimens remain NOT RUN.
+
+## IPC and contracts
+
+Shared owns all commands/events. IPC uses bounded, serialized messages and
+explicit backpressure; never expose references into shared queue storage.
+Increment the protocol version when changing enum ordering or the wire schema,
+update TypeScript guards/tests, and flash both images with the matching UI.
+
+M4 forwards UI records in retried ordered chunks; publish only complete records.
+Keep IPC frames within 288 bytes and UI records within their assembly limit.
+Host-capture drops, M4 queue drops and browser history loss are different metrics;
+do not overwrite or repeatedly sum unrelated counters.
+
+## Wi-Fi and HTTP
+
+Boot loads and validates the persistent Wi-Fi record. A valid record means join
+first without starting the AP; missing/invalid records or read errors fall back
+to the open `GigaUSB` setup AP at `192.168.4.1`, with leasehund DHCP.
+The dashboard accepts SSID/password through `/api/wifi`. Acknowledge submission,
+close the AP, stop its DHCP server, and join the router using a DHCP client.
+Association, driver-link or DHCP failure and later link/lease loss restore setup.
+Persist new credentials only after successful DHCP; compare with the loaded
+record and skip unchanged writes. Failed joins retain the previous record for
+retry on boot. Save failure keeps the station connected and the old valid record.
+`WifiState.saved` reports valid stored-record presence, initialized from valid
+boot load, not a guarantee the current profile is saved. Test old-record presence
+after a new-profile save failure; this hardware check remains NOT RUN. The additive
+`GET /api/wifi` `saved` field requires no IPC version bump; current version is 9.
+No mDNS or automatic cross-network redirect exists; use router leases for the IP.
+
+The open AP and unauthenticated HTTP are development security tradeoffs. Explain
+that credentials are sent unencrypted; do not claim isolation or production security.
+Clear application credential buffers best-effort without promising zeroization of
+compiler or radio-driver copies, or erasure of persisted plaintext credentials.
+Keep network state and link reporting consistent. Persistence hardware checks
+remain NOT RUN until actual integration testing. Cover interrupted garbage
+collection with unit tests; do not present them as hardware power-loss evidence.
+
+HTTP commands are queued: 202 is acceptance, not completion. Event polling is
+cursor-based and bounded. All browser requests need deadlines, including body
+reads, and cancellation must work while connecting. Initial status failure must
+not prevent event polling. Do not use secure-context-only APIs for the HTTP UI.
+
+## Web implementation
+
+Application code and tests belong in `web/src` as TypeScript/TSX. Use SolidJS,
+source-copied solid-ui components, Tailwind v4 via its Vite plugin, ESLint and
+Prettier. No separate PostCSS pipeline or root JavaScript application modules.
+Keep a consistent dark theme, accessible focus states and clear error messages.
+
+Prefer concise user-facing labels. Do not expose implementation jargon such as
+“same-origin HTTP” or protocol version labels in the normal dashboard. Keep
+technical details in expandable trace records and documentation. Use real data,
+never placeholders presented as captures. Render device-controlled text safely.
+
+## Working style and validation
+
+Use straightforward code, imports at the top, small understandable functions and
+existing patterns. No speculative frameworks, redundant helpers, Python scripts,
+extra editor tasks or comments that restate the code. Preserve user changes.
+Implement only features that advance the USB host/diagnostic goal.
+
+Do not change the development Mac's Wi-Fi connection: it disconnects the agent.
+Use a separate client for AP/browser validation. Local browser fixtures can test
+UI behavior but are not hardware tests. Keep temporary test outputs under target
+or system temporary storage; do not add scripts just for one-off investigations.
+
+State validation precisely: formatting, compilation, unit tests, flash verification,
+HTTP transfer, browser rendering and actual USB enumeration are separate checks.
+Never claim that everything works perfectly from compilation alone. Report the
+remaining evidence needed and known limits honestly.
+
+## Additional platform constraints
+
+The USB-A internal PHY is full-speed, not a 480 Mb/s link. The RGB LED is
+active-low: PI12 red, PJ13 green, PE3 blue. Keep SDMMC DMA buffers in M7 AXI SRAM.
+M4 adopts initialized clock metadata rather than reconfiguring shared clocks;
+single-core critical sections are not inter-core locks. There is no heap or
+stack-overflow protection. The host engine and storage parsers belong to M7;
+descriptor/HID processing belongs to M4, not shared.
+
+HID output is limited to six non-modifier keys and signed 8-bit mouse values.
+Keyboard values are HID usage codes, not translated characters.
+Trace payloads are at most 64 bytes. Storage filesystem work has a 30-second
+budget checked between complete BOT commands. LFN entries are skipped;
+subdirectories can be listed but not opened. FAT16, exFAT and GPT are unsupported.
+
+Logging is disabled by default. With `defmt`, decode RTT with the exact flashed
+ELF. RTT is nonblocking; `panic-halt` does not emit a panic report.
+
+## RGB status LED
+
+
+| Indication | Meaning |
+| --- | --- |
+| Slow white pulse | Starting the network services |
+| Blue double pulse | Setup AP available |
+| Slow cyan blink | Joining Wi-Fi or waiting for DHCP |
+| Short yellow pulse | Host enabled, waiting for a USB device |
+| Fast yellow blink | USB attachment/enumeration |
+| Steady green | USB ready |
+| Brief cyan flash | A USB packet completed successfully |
+| Short green pulse | Wi-Fi connected, USB host stopped |
+| Fast magenta blink | Writing Wi-Fi credentials |
+| Red triple pulse | USB fault or network error |
+
+Priority is fault, flash write, enumeration, USB activity, network setup/join,
+then USB ready/waiting or idle. A setup AP therefore remains blue between USB
+activity flashes. Patterns are on/off RGB combinations, not PWM fades. Very
+short credential writes may finish between LED updates. The LED is informational;
+use dashboard/USB-C diagnostics for the exact state and failure reason.
+
+## Hardware setup and debugging
+
+
+Use an external ST-LINK, J-Link or equivalent. The GIGA has no onboard ST-LINK;
+the SPI/ICSP header is not an SWD connector. Consult the board pinout for orientation.
+
+| Probe | GIGA signal |
+| --- | --- |
+| SWDIO | PA13 |
+| SWCLK | PA14 |
+| GND | GND |
+| VTref | Board 3.3 V reference |
+| NRST | RESET / MCU NRST |
+
+Use 3.3 V logic, not 5 V. Power the board normally; VTref is a sense connection.
+Connect NRST for recovery and leave BOOT0 low for normal flash boot.
+
+Inspect and save option bytes before making necessary changes. ELF programming
+does not configure them:
+
+| Option | Required value |
+| --- | --- |
+| `BCM7` | `1` |
+| `BCM4` | `0`; M7 releases M4 after initialization |
+| M7 ADD0 | `0x08000000` vector base; encoded field `0x0800` |
+| M4 ADD0 | `0x08100000` vector base; encoded field `0x0810` |
+| `SWAP_BANK` | `0` |
+
+Encoded boot fields contain address bits `[31:16]`; tools may instead ask for the
+full byte address. Keep ADD1/system-ROM options unchanged, readout protection at
+level 0 and relevant sectors unprotected. Do not change unrelated/security options.
+Apply/reload required changes and power-cycle. Incorrect options can block boot/debug.
+M4 is not a standalone image: it requires M7 initialization.
+
+### Flash, log and debug
+
+**M7 overwrites the Arduino bootloader.** Arduino USB uploading and double-reset
+recovery require restoring that bootloader over SWD.
+
+Release any debugger holding the probe. With both images built, flash **M4 then
+M7**, verify and perform a full reset. CubeProgrammer requires an `.elf` extension:
+
+```sh
+cp target/thumbv7em-none-eabihf/release/m4 target/thumbv7em-none-eabihf/release/m4.elf
+cp target/thumbv7em-none-eabihf/release/m7 target/thumbv7em-none-eabihf/release/m7.elf
+STM32_Programmer_CLI -c port=SWD mode=UR reset=HWrst -w target/thumbv7em-none-eabihf/release/m4.elf -v
+STM32_Programmer_CLI -c port=SWD mode=UR reset=HWrst -w target/thumbv7em-none-eabihf/release/m7.elf -v -rst
+```
+
+ELF addresses determine placement. Ordinary sector-scoped flashing must preserve
+the credential reservation; mass/chip erase removes saved credentials. Do not
+mass erase or supply a raw-binary address. For J-Link, select H747 dual-core support, not H743.
+
+For ordinary probe-rs updates:
+
+```sh
+probe-rs download --chip STM32H747XI --speed 1000 target/thumbv7em-none-eabihf/release/m4
+probe-rs download --chip STM32H747XI --speed 1000 target/thumbv7em-none-eabihf/release/m7
+probe-rs reset --chip STM32H747XI
+```
+
+The stock dual-core target can time out if M4 remains held because M7 is missing
+or faulting. Recover with CubeProgrammer connect-under-reset and matching images,
+not a custom chip YAML. Never run two probe owners at once.
+
+With matching M4 already flashed, display M7 RTT logs using:
+
+```sh
+cargo run -p m7 --release --features defmt
+```
+
+**This `cargo run` workflow flashes/reboots M7 and interrupts the live connection.**
+Ordinary sector-scoped updates must preserve saved credentials.
+Prefer USB-C serial status when diagnosing an existing station connection.
+
+`Embed.toml` selects the chip and SWD at 8 MHz; reduce speed for unreliable wiring.
+The default profile runs after reset. The `debug` profile halts and opens GDB at
+`127.0.0.1:1337`; continue execution to run the application.
+
+### Editor debugging
+
+Zed uses its managed rust-analyzer, formatting on save and package-specific Clippy
+and build-script commands. To check M4, change `--package m7` to `--package m4` in
+both `.zed/settings.json` overrides, then restart the managed language server.
+The latest reported diagnostics refresh showed zero Rust errors. The exact Cargo
+JSON macro-artifact path and loading of the dynamic library providing
+`main_cortex_m`/`task` were verified. These checks do not establish complete HAL
+semantic analysis: Cargo workspace metadata still merges incompatible core HAL
+features. Separate package CLI checks remain authoritative. If diagnostics are
+stale, restart Zed's managed language server; do not install another rust-analyzer,
+hide diagnostics or split the workspace.
+
+Run **Debug: start cargo-embed server (M7)**, then **M7: attach to cargo-embed
+server**. CodeLLDB attaches to the same GDB endpoint; cargo-embed is not a DAP
+server. Disconnect CodeLLDB before stopping the server. The debug-attachment
+workflow remains hardware-unvalidated.
+
+## Network diagnostics and API
+
+M7 runs picoserve with two bounded HTTP workers on port 80. M4's USB-C CDC
+link is independent; a missing serial client must not stop HTTP.
+The setup AP is `192.168.4.1/24`; leasehund assigns `192.168.4.100`–`192.168.4.131`
+with one-hour leases. It is neither an Internet router nor a captive portal.
+After provisioning acceptance, allow about one second before cancelling AP DHCP
+and closing the AP. Association has a 30-second deadline, driver-link wait ten
+seconds, and DHCP 30 seconds. Retain specific failure reasons after fallback.
+
+
+Prefer USB-C status to inspect the running board without rebooting: open
+**GigaUSB Diagnostics** in a serial terminal at **115200 baud**, then send
+`{"command":"status"}` followed by a newline. Every host status, including the
+periodic 1 Hz status, emits the credential-free `UsbEvent::Network { info }`:
+`info` contains `mode`, `mac` (six bytes), `ip` (string or `null`) and `error`
+(reason or `null`). No SSID or password is included.
+
+Stages are `setup` → `associating` → `link_wait` → `dhcp` → `connected`;
+failures report `error`, then restore `setup` while retaining the reason.
+Association distinguishes network-not-found, authentication failure, other join
+failure and timeout. Driver-link and DHCP timeouts are separate; later failures
+identify connection loss or DHCP lease loss. Read `info.ip` in `connected` and
+open `http://<ip>/` from a client on the router network. In `setup`, the IP is
+`192.168.4.1`, not a station lease.
+
+With `defmt` enabled, M7 RTT logs the actual runtime MAC returned by
+`control.address()`, stage/fallback reasons and the station URL once per assigned
+IP (logging again if it changes), never credentials. This is not a claim of a
+factory or unique MAC: the current source supplies a fixed `02:…` address.
+The `cargo run -p m7 --release --features defmt` workflow flashes/reboots
+M7; ordinary sector-scoped updates must preserve saved credentials, but interrupt
+the live connection. Prefer USB-C serial for a live failure.
+
+The reported inability to find the station IP or reach its URL has an
+**UNPROVEN** cause. Collect the stage, IP and reason before attributing it to
+association, driver link, DHCP or HTTP reachability; a lease alone does not prove
+HTTP works. No new hardware result is claimed here.
+
+### Routes
+
+| Route | Request | Response |
+| --- | --- | --- |
+| `GET /` | — | Embedded HTML, `Content-Encoding: gzip`, `Cache-Control: no-cache`, ETag |
+| `GET /api/wifi` | — | `{mode, saved, ssid?, ip?, error?}`; mode is `setup`, `connecting` or `connected` |
+| `POST /api/wifi` | `{ssid, password}` | 202 accepted, 400 invalid credentials, 409 outside setup mode |
+| `POST /api/command` | `{command}` | 202 queued, 503 queue full |
+| `GET /api/events?after=0` | Wrapping `u32` cursor | `{records, cursor, dropped}` |
+
+JSON responses are uncompressed. Wi-Fi status and event responses use
+`Cache-Control: no-store`. Malformed/oversized request JSON is rejected; clients
+must not depend on picoserve's diagnostic error-body text.
+
+SSID must contain 1–32 UTF-8 bytes without NUL; whitespace is significant.
+Passwords may be empty for open networks, 8–63 printable ASCII bytes, or exactly
+64 hexadecimal digits representing a raw WPA2 key.
+
+Commands use serde's externally tagged representation:
+
+```json
+{"command":"start"}
+{"command":"stop"}
+{"command":"reset"}
+{"command":"status"}
+{"command":"storage_list"}
+{"command":{"storage_read":{"file":0,"offset":128}}}
+```
+
+**202 is queue acceptance, not completion.** Commands travel HTTP → M7 → M4 →
+M7 host; execution produces asynchronous events. `status` requests the processor
+snapshot and fresh host status. Start powers USB-A; browser Disconnect does not
+stop it. Invalid command names are rejected during deserialization.
+
+Storage uses an index from the most recent listing, not a path. Read responses
+contain up to 128 bytes and identify index, offset, size and EOF. Downloads must
+validate these before continuing. Listings are shared between clients, not
+transactionally isolated. No writes are supported. Unsupported media, excessive
+files/size and invalid offsets return storage-error events, not file data.
+
+### Event delivery and loss
+
+Each record is `{timestamp_ms, event}`; `event.type` identifies the UI record.
+`UiEvent::Host` contains an externally tagged `UsbEvent`. Exact fields live in
+`firmware/shared/src/usb/types.rs`; browser guards live in `web/src/lib/protocol.ts`.
+
+- IPC frames are at most 288 bytes. M4 serializes each UI record into ordered,
+  retried chunks; M7 publishes only complete records up to 1024 bytes.
+- M7 retains 64 records. Each poll returns at most three; immediately drain full
+  pages, then back off when caught up. Pass the returned cursor on the next poll.
+- Cursors wrap as `u32`. A future cursor restarts at retained history; reset the
+  client cursor to zero for a new connection. Polling is non-destructive.
+- `dropped` combines records missed since the supplied cursor with cumulative
+  assembly overflow. It is a **latest loss snapshot**, not a delta or globally
+  cumulative total; do not sum repeated values.
+- Host-capture drops, M4 queue drops and browser history eviction are separate.
+  Under pressure, semantic records take priority over raw transfer/context
+  records. Loss is counted; bounded queues do not promise lossless capture.
+
+Snapshots retain topology, lifecycle, latest errors/diagnostics and storage
+capability. File listings and file-data replies are live-only, preventing stale
+chunks from satisfying a new read. Relist after reconnecting.
+
+Transfer context precedes its raw packet; association requires adjacent compatible
+records. PID is STM32 DPID encoding: `0=DATA0`, `2=DATA1`, `3=SETUP`. Diagnostics
+retain pre-cleanup registers and include elapsed time/retries. Transfer ID zero
+with empty SETUP denotes controller/idle context, not a real EP0 request.
+These records omit handshakes, CRCs and wire timing.
+
+All browser requests need deadlines covering body reads and external cancellation.
+Initial status failure must not prevent event polling; non-idempotent commands
+must not be automatically retried. Trace filtering must not change USB scheduling.
+
+## Browser state and trace behavior
+
+
+`src/main.tsx` provides the QueryClient. Queries/mutations do not automatically
+retry, and window-focus refetching is disabled. Wi-Fi status is cached under
+`['wifi', 'status']`, stale after two seconds and polled every three seconds until
+an error. Refresh retries explicitly. Acceptance of a provisioning request invalidates
+that query; `GET /api/wifi` requires a boolean `saved` alongside `mode`. This JSON
+addition does not change IPC protocol v9. Credential mutation variables are cleared/reset
+after settlement and are not persisted by the app. Browser/password-manager behavior is outside its control.
+
+Event queries use a fresh session key and retain the cursor, not pages of trace
+data. This prevents cache refetches from replaying records. Full three-record
+pages drain immediately; caught-up queries poll at 150 ms. Initial status failure
+does not block polling. Requests and response-body reads have eight-second
+deadlines. Cancel/disconnect aborts active work; stale responses are ignored.
+
+Commands are mutations: HTTP **202 means queued, not executed**. Completion must
+be observed in events. Queue-full/rejected commands report an error and are never
+automatically retried. Contracts and queue limits are specified above; current protocol is **v9**.
+
+### Trace and device state
+
+- History retains the latest **500 validated records**. Display is newest-first;
+  JSON exports are oldest-first. Exports can contain sensitive input.
+- **Pause display** stops rendering, not reads or capture. **Clear trace** clears
+  browser history only. Disconnect leaves history exportable; reconnect starts a
+  fresh session and replays available board history.
+- Endpoints belong to an interface/alternate setting. Partial topology remains
+  inspectable after failure; a new device session clears stale state.
+- Filters select endpoint (decimal address), direction, transfer kind or errors.
+  Context/payload records are associated only when adjacent and compatible, then
+  grouped by session/transfer ID. Missing context is not guessed.
+- SETUP decoding covers standard and HID/MSC requests. Expanded records show raw
+  bytes, PID, timing/retries and failure snapshots. These are completed host-side
+  transfers, not passive wire capture, handshakes, CRCs or bus timing.
+- Host capture drops, M4 processing drops and the latest transport-loss snapshot
+  are separate metrics. Transport loss is not repeatedly summed. Increased loss
+  requests a bounded/rate-limited status refresh; it does not recover lost trace.
+
+### Read-only storage
+
+The storage card appears after a real capability event. List the FAT32 root,
+then download a regular file up to **64 KiB**. Larger files are rejected by firmware,
+not silently truncated. Only 8.3 aliases, up to 32 entries and no recursion/writes
+are supported; see USB correctness and tracing above for remaining bounds.
+
+One download runs at a time. Each request asks for at most 128 bytes, matched by
+file index, offset and total size. The listener is installed before submission
+because data may arrive before the HTTP acceptance response. Both acceptance and
+valid data are required. Chunks have a ten-second response deadline; disconnect,
+USB session changes, Stop or errors fail the operation. Concurrent clients share
+one listing/index space; do not relist while another client downloads.
+
+## Recorded validation evidence
+
+These are historical results from 2026-11-20, not validation of later edits.
+Compilation, flash verification, HTTP transfer, browser rendering and USB operation
+are separate checks. Current IPC/UI protocol is v9.
+
+### Ownership and accessibility refactor — 2026-11-20
+
+- **PASS, software:** 69 native tests (20 shared, 33 M7, 16 M4), 35 frontend
+  tests, formatting, lint/type checks, separate release Clippy with/without
+  logging, and both release builds. Neither ELF overlaps credential flash.
+- **PASS, flash:** matching refactored images programmed, verified and reset.
+- **PASS, limited hardware:** the receiver enumerated four interfaces/endpoints,
+  configured address 1, and produced a boot-keyboard report: 41 completed packets,
+  zero USB errors. Raw trace/context loss: 29 records. Stop returned disabled /
+  detached without an erroneous cancellation diagnostic. Evidence is in
+  `target/usb-refactor-validation.jsonl`. No lossless capture claim.
+- **PASS, local accessibility audit:** axe-core 4.14.0 found no violations in
+  tested empty, form-error, populated trace/storage and malformed-response states.
+  Keyboard focus and accessible button names were checked in isolated Chrome.
+  Some scrolled trace contrast checks were inconclusive and need manual review;
+  this is not full WCAG certification or hardware-browser validation.
+- **NOT RUN:** broader device compatibility, real storage integrity, current-image
+  Wi-Fi handoff/persistence, and visual verification of every RGB pattern.
+
+Earlier sections below retain their original counts and module layout. They do
+not validate subsequent edits.
+
+### Persistence integration — 2026-11-20
+
+- **PASS, software:** 67 shared Rust tests, 30 frontend tests, formatting, ESLint,
+  TypeScript, separate release Clippy with/without logging, and release builds.
+  Simulated flash tests cover torn writes/erases, page rollover and subsequent
+  recovery/saves; they are not hardware power-loss or ECC evidence.
+- **PASS, layout:** inspected both ELF load ranges; none intersects
+  `0x081C0000..0x08200000`. M4 application flash ends at `0x081C0000` (768 KiB).
+- **PASS, flash/startup:** both matching images programmed and verified without
+  mass erase. After reset, USB-C diagnostics reported setup mode at
+  `192.168.4.1`, runtime MAC `DC:FE:23:68:94:E1`. This differs from the
+  configured NVRAM fallback; use the runtime value for router lookup.
+- **NOT RUN:** successful real credential write, saved-network boot without AP,
+  wrong/unavailable-network fallback, unchanged-write suppression on hardware,
+  update preservation of an existing record, and concurrent USB/network continuity
+  during bank-2 writes/erase. These require a separate provisioning client and
+  known test router; the development Mac's Wi-Fi was not changed.
+
+### Recorded v8 results — 2026-11-20
+
+- **PASS, software:** 57 Rust tests, 28 frontend tests, Rust/Prettier formatting,
+  ESLint, TypeScript, per-core release Clippy with and without logging, and both
+  release builds with logging.
+- **PASS, flash:** both matching v8 images programmed, verified and system-reset.
+- **PASS, limited hardware:** repeated the receiver enumeration through USB-C:
+  four interfaces, four associated endpoints, five complete report-descriptor
+  chunks, configuration at address 1, boot-keyboard decoding and 41 packets.
+  USB errors: 0. Lost raw trace/context records: 20; no lossless claim.
+- **PASS, stopped state:** Stop followed by Status reported `enabled:false`,
+  `attached:false`. No electrical VBUS measurement.
+- Evidence: `target/usb-v8-validation.jsonl`. v8 browser rendering, actual failed
+  transfers, real storage, non-boot semantic input and network handoff/recovery
+  scenarios remain NOT RUN. Historical v7 browser fixtures below are not v8
+  browser evidence.
+
+### Recorded v7 results — 2026-11-20
+
+- **PASS, software:** frontend formatting/lint/type checking, 28 frontend tests,
+  Rust formatting, per-core release Clippy, 57 shared Rust tests, and both release
+  builds. Release checks with logging disabled also passed during integration.
+- **PASS, flash:** matching protocol-v7 M4 and M7 images programmed and verified
+  with CubeProgrammer, followed by a full system reset.
+- **PASS, limited hardware:** USB-C commands exercised the real four-interface
+  Logitech receiver `046D:C548`. It enumerated full-speed, configured address 1 /
+  configuration 1, published all four interface/endpoint associations, complete
+  54-byte and 429-byte `0x22` report descriptors for interfaces 2/3, and an eight-byte
+  boot-keyboard report. Final status: 41 completed packets, zero USB errors.
+- **LIMIT observed:** the enumeration burst lost 22 expendable raw trace/context
+  records. Semantic records survived priority queueing. This is not lossless
+  capture. Evidence from this local run is under `target/usb-v7-validation.jsonl`.
+- **PASS, stopped state:** a subsequent status query reported `enabled:false`,
+  `attached:false`; USB-A was left stopped after testing. No electrical VBUS
+  measurement was made.
+- **PASS, local browser fixture only (v7):** the actual gzip bundle rendered dark in
+  isolated Chrome; queries, interface grouping, decoded trace filters, partial
+  topology after failure, and a 301-byte download assembled as 128/128/45 bytes
+  worked. This is not on-board HTTP or real-media validation.
+- **NOT RUN:** real keystroke/mouse transitions, directly attached low-speed
+  mouse, non-boot semantic input, physical disconnect/recovery and STALL
+  injection, real mass-storage/checksum tests, and current-image Wi-Fi handoff,
+  DHCP failure, link-loss recovery and multiple-client scenarios.
+
+## Hardware regression procedures — NOT RUN
+
+Record commit, protocol, bundle/image identifiers, board/power/probe, peripheral
+VID/PID/model/speed, client/browser/router, steps, expected and observed results,
+elapsed time and sanitized evidence. Mark each check PASS/FAIL/NOT RUN and keep
+host, M4 and browser loss counters separate. Never retain credentials or sensitive
+input. Historical partial checks do not complete these procedures.
+
+Before flashing, run the build checks above and logging-disabled release builds
+for each core separately. Inspect both ELF load ranges and linker maps to exclude
+credential flash. Retain verification output and use the flashing procedure above.
+Interrupted garbage-collection tests are not hardware power-loss/ECC evidence.
+
+### Safe hardware setup
+
+
+- Use a separate phone/laptop for AP and browser tests. **Do not change the
+  development Mac's Wi-Fi.** Never connect USB-A to another computer.
+- Respect board/peripheral power limits; use non-sensitive test keystrokes.
+- Boot without Start: expect USB-A VBUS off. Record observation/measurement.
+- Save real event exports and diagnostics, not fixture data presented as captures.
+
+### Real-device matrix — each row NOT RUN
+
+| Device | Exercise | Expected evidence |
+| --- | --- | --- |
+| Full-speed keyboard | Start, press/release keys and modifiers | Speed, descriptors, address/configuration, correct transitions without stuck keys |
+| Direct low-speed mouse | Move both directions, click, wheel if supported | Low-speed enumeration, signed relative axes/buttons, no hub-specific configuration |
+| Composite keyboard/mouse receiver | Exercise each supported interface and report ID | Up to four HID interfaces polled; independent input state and correct report routing |
+| Unsupported device/layout | Attach a hub, unsupported class or out-of-subset HID | Explicit unsupported/error evidence; no invented input or controller hang; partial topology retained |
+| FAT32 flash drive | List root and read known files | BOT capacity, FAT32 mount, bounded listing, exact bytes/length/checksum; see below |
+
+Limits to test, not broad compatibility promises: one directly attached low/full-
+speed root device, one active host channel, configuration/report descriptors up
+to 1024 bytes. HID supports boot keyboard/mouse and a bounded non-boot keyboard/
+mouse subset with report IDs and relative axes: at most four HID interfaces,
+64 fields total per parsed layout across at most eight reports. Arbitrary HID,
+absolute axes, general composites and hubs are not supported.
+
+### Lifecycle, traces and diagnostics — NOT RUN
+
+1. Start with no device; attach, exercise input, unplug during activity, reattach.
+   Repeat Stop/Start and Reset while active and idle. Expected: bounded recovery,
+   correct lifecycle/session state, no stale input or storage selection, VBUS off
+   after Stop, and a fresh enumeration after restart/reset.
+2. Disconnect/reconnect only the browser. Expected: board operation continues;
+   cursor polling resumes with explicit bounded-history loss where applicable.
+3. Exercise each available trace filter with known control, interrupt and bulk
+   activity; clear filters and export. Expected: matching visible records, no
+   fabricated packets, and no change to USB scheduling from display filtering.
+   Verify session/transfer/endpoint correlation, stage, elapsed time and retries;
+   successful packet bytes/PID must agree with the transfer, at most 64 bytes per
+   record. NAK retries must not flood queues. This is not handshake/CRC/timing capture.
+4. For a real unsupported/failing enumeration, save the last successful descriptor
+   and diagnostic: error, SETUP bytes, session/transfer ID, endpoint, Setup/Data/
+   Status stage, `elapsed_us`, `retries` and controller snapshots. Expected: partial topology remains
+   inspectable after failure rather than disappearing; a new session clears stale
+   context. Do not induce electrical faults to manufacture a failure.
+5. Poll slowly and use multiple clients under input/storage traffic. Expected:
+   responsive commands, bounded queues and distinct loss metrics; 202 indicates
+   acceptance only. Retain completion/error records to establish execution.
+
+### Read-only storage — NOT RUN
+
+Use an existing, backed-up, non-sensitive FAT32 test drive and ordinary test data.
+**Never format a user's disk or modify it to force fragmentation.** No automated
+installed scripts are required. Choose a known small file and an already
+fragmented file (record independently verified cluster layout if available).
+If no fragmented specimen exists, leave that case NOT RUN.
+
+Supported: BOT/SCSI LUN 0, 512-byte sectors, MBR FAT32 or FAT32 superfloppy,
+root 8.3 aliases, at most 32 entries, files at most 64 KiB. LFN entries are skipped;
+subdirectories can be listed but not opened. Root scan is capped at 32 sectors,
+chains at 128 distinct clusters; filesystem work has a 30-second budget checked
+between complete BOT commands. No writes, formatting, exFAT, FAT16, GPT,
+subdirectory traversal or multi-LUN support is promised.
+
+1. Before attachment, record names, byte lengths and SHA-256 of known files using
+   ordinary read-only host tools (for example `shasum -a 256 /path/to/SMALL.TXT`).
+   Keep the manifest outside the test drive; avoid host tools that write metadata.
+2. Start, retain capacity/mount events, request root listing, then read the small
+   and fragmented files. Reassemble returned data in offset order, retain exact
+   bytes outside the drive, compare lengths and SHA-256 with the manifest.
+   Expected: byte-for-byte agreement, explicit completion, no missing/duplicate
+   chunks silently accepted. Test empty and 64-KiB files if already available.
+3. With existing suitable media/data, request a directory, file above 64 KiB,
+   invalid selection/offset, and unsupported volume. Expected: explicit bounded
+   errors, no hang or falsely successful partial file. Boundary cases without
+   suitable safe media remain NOT RUN; malformed-media fixtures are host tests.
+4. Unplug or Stop during a read, then reconnect and list again. Expected: bounded
+   cancellation/error and fresh selection; no stale file chunks treated as new.
+5. Inspect SCSI command evidence: only inquiry, readiness, request-sense, capacity
+   and READ(10), plus BOT recovery as needed; no WRITE/FORMAT commands. Recheck
+   original file checksums after testing with a read-only host workflow. Unchanged
+   files alone do not prove no writes; retain command evidence too.
+
+### Wi-Fi/HTTP with a separate client — each row NOT RUN
+
+Use a trusted test router; open AP and unauthenticated HTTP expose credentials
+and board control. Do not publish passwords in logs, screenshots or exports.
+
+| Check | Procedure and expected evidence |
+| --- | --- |
+| Setup fallback | With a missing/invalid record or injected read error, cold boot falls back to GigaUSB; separate client receives DHCP and opens 192.168.4.1. Invalid data is rejected, `saved:false`; record HTTP transfer/rendering separately. Use controlled fixtures on a test board, never a user's disk. |
+| Bundle/API | Verify `/` is HTML with `Content-Encoding: gzip`; JSON is uncompressed. Confirm body reads complete, event polling starts even after initial status failure, and connecting can be cancelled. |
+| Correct password / persistence | Submit valid test-router credentials; 202 precedes AP shutdown/DHCP-server stop. Persist only after successful DHCP. Find station lease and open board IP; cold boot then joins first without starting the AP and reports `saved:true`. No redirect/mDNS expected. |
+| Wrong password / retained record | Submit incorrect credentials; bounded association failure restores setup AP/DHCP without overwriting the previous valid record. Cold boot retries that previous record. Never retain credentials in evidence. |
+| DHCP failure | On an isolated test router allow association but withhold DHCP; expect bounded failure and restored setup AP. Do not alter the development network. |
+| Drop link | After successful station join, disable test AP/link; expect recovery to setup AP and working DHCP/HTTP, not stale connected status. |
+| Multiple clients | Two separate clients poll and issue status concurrently; record independent cursors, bounded loss reporting and responsive HTTP; do not assume client isolation. |
+| Unchanged record | Re-submit the loaded profile, complete DHCP and verify no flash write occurs. Compare against the loaded record, not just RAM from the latest submission. |
+| Save failure / status | With an old valid record, inject failure saving a new profile after DHCP. Station stays connected; old record survives and `saved:true` means old valid-record presence, not current-profile persistence. Verify this reporting path explicitly. Without an old valid record, failed save reports `saved:false`. |
+| Firmware update preservation | After saving a valid profile, ordinary sector-scoped M4 then M7 updates preserve it; cold boot rejoins. Inspect flash scope/ELFs first. Mass/chip erase removes credentials; do not perform one merely to test this. |
+| Concurrent USB / flash | Exercise credential writes and garbage-collection erases during keyboard/mouse input, then read-only storage reads and HTTP polling. Bank-2 operations can stall M4 flash fetches despite async APIs; record continuity/errors, network state, drops and file checksums. Do not assume M4 quiescence or infer USB continuity from network success. |
+| Credential handling | Inspect sanitized logs for absence of credentials. Storage is plaintext; application RAM clearing is best-effort, not guaranteed zeroization or persistent erasure. Interrupted-GC unit tests are not hardware power-loss evidence. |
+
+Actual router handoff/recovery, on-board dashboard rendering, broader HID
+interoperability and real-media storage integrity remain NOT RUN. The v7 fixture
+and limited receiver results above do not establish these or validate v9 persistence.

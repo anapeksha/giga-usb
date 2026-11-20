@@ -1,0 +1,24 @@
+[default.general]
+chip = "STM32H747XI"
+connect_under_reset = false
+
+[default.probe]
+protocol = "Swd"
+speed = 8000
+
+[default.reset]
+halt_afterwards = false
+
+[default.rtt]
+enabled = true
+up_channels = [{ channel = 0, format = "Defmt" }]
+
+[default.gdb]
+enabled = false
+
+[debug.reset]
+halt_afterwards = true
+
+[debug.gdb]
+enabled = true
+gdb_connection_string = "127.0.0.1:1337"
