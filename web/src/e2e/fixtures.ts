@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { test as base, expect } from '@playwright/test';
 import type { Command } from '../lib/http';
 import type { ProtocolRecord, RecordEvent } from '../lib/protocol';
+import { fixtureTracePage } from './trace-query-fixture';
 
 export const test = base.extend<
   {
@@ -12,6 +13,8 @@ export const test = base.extend<
       cursors: number[];
       commandStatus: number;
       eventsStatus: number;
+      traceStatus: number;
+      traceRequests: URLSearchParams[];
       holdEvents: () => () => void;
       holdCommand: (command: Command, status?: number) => () => void;
       pending: boolean;
@@ -58,6 +61,8 @@ export const test = base.extend<
       cursors: [] as number[],
       commandStatus: 202,
       eventsStatus: 200,
+      traceStatus: 200,
+      traceRequests: [] as URLSearchParams[],
       holdEvents() {
         let release!: () => void;
         heldEvents = new Promise<void>((resolve) => {
@@ -106,6 +111,16 @@ export const test = base.extend<
           await gate.wait;
         }
         await route.fulfill({ status: gate?.status ?? api.commandStatus });
+      } else if (url.pathname === '/api/trace') {
+        api.traceRequests.push(url.searchParams);
+        const result = fixtureTracePage(api.records, url.searchParams);
+        await route.fulfill(
+          api.traceStatus !== 200
+            ? { status: api.traceStatus }
+            : result === null
+              ? { status: 400 }
+              : { json: result },
+        );
       } else if (url.pathname === '/api/events') {
         const after = Number(url.searchParams.get('after'));
         api.cursors.push(after);

@@ -1,6 +1,6 @@
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { decodeSetup, groupTrace, filterTrace } from './trace';
+import { decodeSetup, groupTrace } from './trace';
 import { applyRecord, createState, hostEvent, summary, type ProtocolRecord } from './protocol';
 const record = (event: unknown) =>
   ({ timestamp_ms: 1, event: { type: 'host', event } }) as ProtocolRecord;
@@ -41,18 +41,6 @@ test('groups only context-before-packet, preserves partial and mixed history', (
   assert.equal(
     groupTrace([record({ transfer_context: { ...context, endpoint: 129 } }), packet]).length,
     2,
-  );
-  assert.equal(
-    filterTrace(groups, { endpoint: '0', direction: 'out', kind: 'control', errors: false }).length,
-    1,
-  );
-  assert.equal(
-    filterTrace(groups, { endpoint: '129', direction: '', kind: '', errors: false }).length,
-    0,
-  );
-  assert.equal(
-    filterTrace(groups, { endpoint: '', direction: '', kind: '', errors: true }).length,
-    0,
   );
 });
 test('new payload guards reject missing fields, overlong data and numeric overflow', () => {

@@ -10,6 +10,9 @@ import {
   PROTOCOL_VERSION,
 } from './lib/protocol';
 import {
+  getTracePage,
+  normalizeTraceFilters,
+  type TraceFilterInput,
   applyEventPage,
   createLossRefreshGuard,
   getEventPage,
@@ -120,7 +123,65 @@ export function createHttpController() {
     },
   }));
 
+  const [traceFilters, setTraceFilters] = createSignal(
+    normalizeTraceFilters({ endpoint: '', direction: '', kind: '', errors: false, q: '' }),
+  );
+  const [traceEpoch, setTraceEpoch] = createSignal(0);
+  const [traceDebouncing, setTraceDebouncing] = createSignal(false);
+  let traceSearchTimer: ReturnType<typeof setTimeout> | undefined;
+  onCleanup(() => clearTimeout(traceSearchTimer));
+  const [filteredRecords, setFilteredRecords] = createSignal<ProtocolRecord[]>([]);
+  const [traceDropped, setTraceDropped] = createSignal(0);
+  let traceCursor = 0;
+  let traceHistory: ProtocolRecord[] = [];
+  const resetTrace = () => {
+    void client.cancelQueries({ queryKey: ['trace', sessionId(), traceEpoch()], exact: true });
+    traceCursor = 0;
+    setTraceDropped(0);
+    traceHistory = [];
+    setFilteredRecords([]);
+    setTraceEpoch((value) => value + 1);
+  };
+  const filteredTrace = createQuery<{ cursor: number }>(() => ({
+    queryKey: ['trace', sessionId(), traceEpoch()],
+    enabled: active() && traceFilters().active && !traceFilters().error && !traceDebouncing(),
+    networkMode: 'always',
+    retry: false,
+    gcTime: 0,
+    staleTime: 0,
+    refetchOnReconnect: false,
+    refetchInterval: (query) => (query.state.status === 'error' ? false : 150),
+    queryFn: async ({ signal }) => {
+      const epoch = traceEpoch();
+      const current = session;
+      const filters = traceFilters();
+      try {
+        for (let index = 0; index < MAX_EVENT_PAGES; index++) {
+          const page = await getTracePage(traceCursor, filters, signal);
+          if (signal.aborted || epoch !== traceEpoch() || current !== session)
+            throw new Error('Cancelled');
+          const seen = new Set(traceHistory.map((record) => record.sequence));
+          for (const item of page.records) {
+            if (!seen.has(item.sequence)) {
+              traceHistory.push({ ...item.record, sequence: item.sequence });
+              seen.add(item.sequence);
+            }
+          }
+          traceHistory = traceHistory.slice(-500);
+          traceCursor = page.cursor;
+          setTraceDropped(page.dropped);
+          if (page.records.length < 3) break;
+        }
+      } finally {
+        if (epoch === traceEpoch() && current === session && !signal.aborted && !paused())
+          setFilteredRecords([...traceHistory]);
+      }
+      return { cursor: traceCursor };
+    },
+  }));
+
   function disconnect() {
+    void client.cancelQueries({ queryKey: ['trace', sessionId(), traceEpoch()], exact: true });
     session?.abort();
     session = null;
     setActive(false);
@@ -132,6 +193,7 @@ export function createHttpController() {
     const current = new AbortController();
     session = current;
     cursor = 0;
+    resetTrace();
     refreshGuard = createLossRefreshGuard();
     state = { ...createState(), transportDropped: 0 };
     setPaused(false);
@@ -224,6 +286,31 @@ export function createHttpController() {
   onCleanup(disconnect);
   return {
     snapshot,
+    traceFilters,
+    filteredRecords,
+    traceDropped,
+    setTraceFilters: (input: TraceFilterInput) => {
+      if (paused() || !connected()) return;
+      const normalized = normalizeTraceFilters(input);
+      if (JSON.stringify(normalized) === JSON.stringify(traceFilters())) return;
+      const searchChanged = normalized.q !== traceFilters().q;
+      clearTimeout(traceSearchTimer);
+      setTraceDebouncing(searchChanged);
+      setTraceFilters(normalized);
+      resetTrace();
+      if (searchChanged) traceSearchTimer = setTimeout(() => setTraceDebouncing(false), 200);
+    },
+    traceLoading: () =>
+      traceFilters().active &&
+      !traceFilters().error &&
+      active() &&
+      (traceDebouncing() || filteredTrace.isLoading),
+    traceError: () =>
+      traceFilters().error ||
+      (traceFilters().active && filteredTrace.error ? message(filteredTrace.error) : ''),
+    retryTrace: () => {
+      if (active() && !traceFilters().error) void filteredTrace.refetch();
+    },
     downloading: () => download.isPending,
     downloadingFile: () => (download.isPending ? download.variables?.file.index : undefined),
     download: (file: HostPayloads['file']) => {
@@ -258,10 +345,15 @@ export function createHttpController() {
     },
     togglePaused: () => {
       setPaused((value) => !value);
-      if (!paused()) publish();
+      if (!paused()) {
+        publish();
+        setFilteredRecords([...traceHistory]);
+      }
     },
     clear: () => {
       state.history = [];
+      traceHistory = [];
+      setFilteredRecords([]);
       publish();
     },
     exportTrace: () => {

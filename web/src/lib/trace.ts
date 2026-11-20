@@ -65,7 +65,7 @@ export function groupTrace(records: ProtocolRecord[]): TraceGroup[] {
       context.endpoint === p[1].endpoint &&
       (r.sequence === undefined ||
         records[i - 1].sequence === undefined ||
-        r.sequence === records[i - 1].sequence! + 1)
+        r.sequence === (records[i - 1].sequence! + 1) >>> 0)
     ) {
       result.pop();
       const key = `${context.session_id}:${context.transfer_id}:${context.kind}`;
@@ -110,24 +110,4 @@ export function groupTrace(records: ProtocolRecord[]): TraceGroup[] {
     });
   });
   return result;
-}
-export function filterTrace(
-  groups: TraceGroup[],
-  filter: { endpoint: string; direction: string; kind: string; errors: boolean },
-) {
-  return groups.filter(
-    (g) =>
-      (!filter.endpoint ||
-        g.records.some((r) => {
-          const p = r.event.type === 'host' ? hostEvent(r.event.event) : null;
-          return p && 'endpoint' in p[1] && p[1].endpoint === Number(filter.endpoint);
-        })) &&
-      (!filter.direction ||
-        g.records.some((r) => {
-          const p = r.event.type === 'host' ? hostEvent(r.event.event) : null;
-          return p?.[0] === 'transfer' && p[1].direction === filter.direction;
-        })) &&
-      (!filter.kind || g.kind === filter.kind) &&
-      (!filter.errors || g.error),
-  );
 }

@@ -224,7 +224,7 @@ test('trace filters decode fixture records; reconnect resets cursor without repl
     '"transfer_id": 1',
   );
   await setupPacket.click();
-  await search.fill('  RECEIVED · ENDPOINT 129  ');
+  await search.fill('  RECEIVED ENDPOINT 129  ');
   await expect(trace.getByText('Received · endpoint 129', { exact: true })).toBeVisible();
   await expect(context).toHaveCount(0);
   await expect(setupPacket).toHaveCount(0);
@@ -259,13 +259,28 @@ test('trace filters decode fixture records; reconnect resets cursor without repl
   await page.keyboard.press('Space');
   await expect(page.getByRole('checkbox', { name: 'Errors only' })).toBeChecked();
   await expect(trace.getByText(/No matching events/)).toBeVisible();
+  await expect
+    .poll(() => Object.fromEntries(api.traceRequests.at(-1) ?? []))
+    .toMatchObject({ endpoint: '0', direction: 'out', kind: 'control', errors: 'true' });
+  const colors = await page.getByRole('checkbox', { name: 'Errors only' }).evaluate((input) => {
+    const root = input.parentElement!;
+    const control = root.querySelector('.size-4')!;
+    const style = getComputedStyle(control);
+    return {
+      border: style.borderColor,
+      background: style.backgroundColor,
+      label: getComputedStyle(root.querySelector('label')!).color,
+    };
+  });
+  expect(colors.border).toBe(colors.background);
+  expect(colors.label).not.toBe(colors.background);
   await page.getByRole('button', { name: 'Disconnect', exact: true }).click();
   api.cursors.length = 0;
   await page.getByRole('button', { name: 'Connect', exact: true }).click();
   await expect.poll(() => api.cursors.length).toBeGreaterThan(1);
   expect(api.cursors[0]).toBe(0);
   await expect(
-    page.getByText('3 records · newest first · board time', { exact: true }),
+    page.getByText('0 records · newest first · board time', { exact: true }),
   ).toBeVisible();
 });
 

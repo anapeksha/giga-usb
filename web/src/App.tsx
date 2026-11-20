@@ -314,6 +314,14 @@ export default function App() {
       </Show>
       <Trace
         records={state().history}
+        filteredRecords={http.filteredRecords()}
+        filtersActive={http.traceFilters().active}
+        setTraceFilters={http.setTraceFilters}
+        traceLoading={http.traceLoading()}
+        traceDropped={http.traceDropped()}
+        connected={http.connected()}
+        traceError={http.traceError()}
+        retryTrace={http.retryTrace}
         transportDropped={state().transportDropped}
         hostDropped={state().dropped}
         paused={http.paused()}

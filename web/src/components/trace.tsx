@@ -2,7 +2,8 @@ import { For, Show, createEffect, createMemo, createSignal, on, onCleanup } from
 import { createVirtualizer } from '@tanstack/solid-virtual';
 import { traceRecordKey, viewportGroups, survivingAnchor } from '../lib/trace-viewport';
 import { hex, hostEvent, summary, type ProtocolRecord } from '../lib/protocol';
-import { decodeSetup, groupTrace, filterTrace } from '../lib/trace';
+import { decodeSetup, groupTrace } from '../lib/trace';
+import type { TraceFilterInput } from '../lib/http';
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from './ui/card';
 import { Button } from './ui/button';
 import { Accordion, AccordionItem, AccordionTrigger, AccordionContent } from './ui/accordion';
@@ -67,11 +68,13 @@ function TraceRecord(props: { record: ProtocolRecord }) {
 function TraceFilter(props: {
   label: string;
   options: string[];
+  disabled?: boolean;
   value: string;
   onChange: (value: string) => void;
 }) {
   return (
     <Combobox
+      disabled={props.disabled}
       options={props.options}
       value={props.value || 'All'}
       onChange={(value) => props.onChange(value === 'All' ? '' : (value ?? ''))}
@@ -97,6 +100,14 @@ function TraceFilter(props: {
 }
 export function Trace(props: {
   records: ProtocolRecord[];
+  filteredRecords?: ProtocolRecord[];
+  filtersActive?: boolean;
+  setTraceFilters?: (filters: TraceFilterInput) => void;
+  traceLoading?: boolean;
+  traceDropped?: number;
+  connected?: boolean;
+  traceError?: string;
+  retryTrace?: () => void;
   transportDropped: number;
   hostDropped: number;
   paused: boolean;
@@ -109,7 +120,16 @@ export function Trace(props: {
   const [kind, setKind] = createSignal('');
   const [errors, setErrors] = createSignal(false);
   const [search, setSearch] = createSignal('');
-  const searchQuery = createMemo(() => search().trim().toLowerCase());
+  const filtersDisabled = () => props.paused || !props.connected;
+  createEffect(() =>
+    props.setTraceFilters?.({
+      endpoint: endpoint(),
+      direction: direction(),
+      kind: kind(),
+      errors: errors(),
+      q: search(),
+    }),
+  );
   const endpointInvalid = createMemo(
     () =>
       endpoint() !== '' &&
@@ -118,42 +138,25 @@ export function Trace(props: {
         Number(endpoint()) < 0 ||
         Number(endpoint()) > 255),
   );
-  const records = createMemo(() => props.records, undefined, {
-    equals: (a, b) => a.length === b.length && a.every((r, i) => r === b[i]),
-  });
+  const records = createMemo(
+    () => (props.filtersActive ? (props.filteredRecords ?? []) : props.records),
+    undefined,
+    {
+      equals: (a, b) => a.length === b.length && a.every((r, i) => r === b[i]),
+    },
+  );
   const [expanded, setExpanded] = createSignal(new Set<string>());
   createEffect(() => {
     const retained = new Set(records().map(traceRecordKey));
     setExpanded((previous) => new Set([...previous].filter((key) => retained.has(key))));
   });
-  const newest = createMemo(() =>
-    endpointInvalid()
-      ? []
-      : filterTrace(groupTrace(records()), {
-          endpoint: endpoint(),
-          direction: direction().toLowerCase(),
-          kind: kind().toLowerCase(),
-          errors: errors(),
-        })
-          .filter(
-            (group) =>
-              !searchQuery() ||
-              group.records.some((record) => {
-                const packet = record.event.type === 'host' ? hostEvent(record.event.event) : null;
-                const text = [summary(record)];
-                if (packet?.[0] === 'transfer') {
-                  text.push(packet[1].data.map((value) => hex(value).slice(2)).join(' '));
-                  if (packet[1].pid === 3) text.push(decodeSetup(packet[1].data));
-                }
-                return text.some((value) => value.toLowerCase().includes(searchQuery()));
-              }),
-          )
-          .reverse(),
-  );
+  const newest = createMemo(() => groupTrace(records()).reverse());
   const rows = createMemo(() => viewportGroups(newest()));
   const filterKey = createMemo(() =>
-    JSON.stringify([endpoint(), direction(), kind(), errors(), searchQuery()]),
+    JSON.stringify([endpoint(), direction(), kind(), errors(), search()]),
   );
+  // Server results and unfiltered browser history use independent sequence spaces.
+  createEffect(on(filterKey, () => setExpanded(new Set<string>()), { defer: true }));
   let viewport!: HTMLDivElement;
   let committedRows: ReturnType<typeof rows> = [];
   let anchor: { key: string; offset: number; record?: string; recordOffset?: number } | undefined;
@@ -265,7 +268,7 @@ export function Trace(props: {
         <div>
           <CardTitle>USB trace</CardTitle>
           <CardDescription class="mt-2">
-            {props.records.length} records · newest first · board time
+            {records().length} records · newest first · board time
             {props.paused ? ' · display paused' : ''}
           </CardDescription>
         </div>
@@ -296,9 +299,14 @@ export function Trace(props: {
             </Accordion>
           </Callout>
         </Show>
-        <div class="mb-4 flex flex-wrap items-start gap-3">
+        <fieldset
+          disabled={filtersDisabled()}
+          class="mb-4 flex flex-wrap items-start gap-3"
+          aria-label="Trace filters"
+        >
           <NumberField
             class="grid w-40 gap-1"
+            disabled={filtersDisabled()}
             value={endpoint()}
             onChange={setEndpoint}
             minValue={0}
@@ -319,12 +327,14 @@ export function Trace(props: {
             </NumberFieldErrorMessage>
           </NumberField>
           <TraceFilter
+            disabled={filtersDisabled()}
             label="Direction"
             options={['All', 'IN', 'OUT']}
             value={direction()}
             onChange={setDirection}
           />
           <TraceFilter
+            disabled={filtersDisabled()}
             label="Transfer"
             options={['All', 'Control', 'Interrupt', 'Bulk']}
             value={kind()}
@@ -332,6 +342,7 @@ export function Trace(props: {
           />
           <TextField
             class="grid min-w-0 w-full gap-1 sm:w-64"
+            disabled={filtersDisabled()}
             value={search()}
             onChange={setSearch}
           >
@@ -342,11 +353,41 @@ export function Trace(props: {
           </TextField>
           <div class="grid gap-1">
             <span aria-hidden="true" class="h-4" />
-            <Checkbox class="h-10" checked={errors()} onChange={setErrors}>
+            <Checkbox
+              class="h-10"
+              destructive
+              disabled={filtersDisabled()}
+              checked={errors()}
+              onChange={setErrors}
+            >
               Errors only
             </Checkbox>
           </div>
-        </div>
+        </fieldset>
+        <p class="mb-3 text-xs text-muted-foreground">Searches recent board history.</p>
+        <Show when={props.filtersActive && (props.traceDropped ?? 0) > 0}>
+          <p class="mb-3 text-sm text-muted-foreground">
+            Earlier board history is no longer available.
+          </p>
+        </Show>
+        <Show when={props.traceLoading}>
+          <p role="status" class="mb-3 text-sm">
+            Searching…
+          </p>
+        </Show>
+        <Show when={props.traceError}>
+          <Callout variant="error" class="mb-3 text-sm" role="alert">
+            {props.traceError}{' '}
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={filtersDisabled()}
+              onClick={props.retryTrace}
+            >
+              Retry search
+            </Button>
+          </Callout>
+        </Show>
         <div
           ref={viewport}
           class="trace-scroll"
