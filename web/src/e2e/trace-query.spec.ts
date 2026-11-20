@@ -1,3 +1,4 @@
+import { readFile } from 'node:fs/promises';
 import { test, expect } from './fixtures';
 import type { RecordEvent } from '../lib/protocol';
 import type { Route } from '@playwright/test';
@@ -109,4 +110,63 @@ test('search uses retained server history and a 404 is retryable without disconn
   ).toBeVisible();
   await expect(page.getByRole('alert').filter({ hasText: 'HTTP 404' })).toHaveCount(0);
   expect(api.traceRequests.at(-1)?.get('q')).toBe('received endpoint 129');
+});
+
+test('partial filtered results and loss snapshots stay separate from canonical history', async ({
+  page,
+  api,
+  appURL,
+}) => {
+  for (let index = 0; index < 3; index++) api.emit(packet);
+  api.emit({
+    type: 'host',
+    event: { transfer: { endpoint: 130, direction: 'in', pid: 2, bytes: 1, data: [3] } },
+  });
+  await page.goto(appURL);
+  await expect(
+    page.getByText('4 records · newest first · board time', { exact: true }),
+  ).toBeVisible();
+  const cursors: number[] = [];
+  let failing = true;
+  await page.route('**/api/trace?**', (route) => {
+    const after = Number(new URL(route.request().url()).searchParams.get('after'));
+    cursors.push(after);
+    if (after === 0)
+      return route.fulfill({
+        json: {
+          records: api.records
+            .slice(0, 3)
+            .map((record, index) => ({ sequence: index + 1, record })),
+          cursor: 3,
+          dropped: 11,
+        },
+      });
+    if (failing) return route.fulfill({ status: 503 });
+    return route.fulfill({ json: { records: [], cursor: 4, dropped: 0 } });
+  });
+  await page.getByRole('spinbutton', { name: 'Endpoint', exact: true }).fill('129');
+  await expect(page.getByRole('alert').filter({ hasText: 'HTTP 503' })).toBeVisible();
+  await expect(
+    page.getByText('3 records · newest first · board time', { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByText('Earlier board history is no longer available.', { exact: true }),
+  ).toBeVisible();
+  const polls = api.cursors.length;
+  await expect.poll(() => api.cursors.length).toBeGreaterThan(polls + 2);
+  expect(cursors).toEqual([0, 3]);
+  await expect(page.getByRole('button', { name: 'Disconnect', exact: true })).toBeVisible();
+  failing = false;
+  await page.getByRole('button', { name: 'Retry search', exact: true }).click();
+  await expect(page.getByRole('alert').filter({ hasText: 'HTTP 503' })).toHaveCount(0);
+  expect(cursors.slice(0, 3)).toEqual([0, 3, 3]);
+  await expect(
+    page.getByText('Earlier board history is no longer available.', { exact: true }),
+  ).toHaveCount(0);
+  const pending = page.waitForEvent('download');
+  await page.getByRole('button', { name: 'Export trace', exact: true }).click();
+  const download = await pending;
+  const exported = JSON.parse(await readFile((await download.path())!, 'utf8'));
+  expect(exported).toHaveLength(4);
+  expect(exported[3].event.event.transfer.endpoint).toBe(130);
 });
