@@ -383,6 +383,14 @@ the host stopped. Evidence is in `target/virtualized-ui-flash-status.jsonl`.
 This does not establish on-board browser rendering, USB activity or resolution
 of the earlier controller fault.
 
+The AP-only LED update in `89b462d` was flashed M4 then M7, verified and
+system-reset. All 63 native Rust tests passed, including LED timing/priority and
+AP readiness/error tests. M7 Clippy and separate per-core release builds passed
+with and without logging. USB-C startup status reported AP mode at `192.168.4.1`,
+no network error, zero USB errors and the host stopped. Evidence is in
+`target/ap-led-flash-status.jsonl`. Physical observation of every LED pattern,
+USB activity and on-board browser validation were not performed in this run.
+
 ### Routes
 
 | Route | Request | Response |
