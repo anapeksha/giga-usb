@@ -1,4 +1,4 @@
-import test from 'node:test';
+import { test } from 'vitest';
 import assert from 'node:assert/strict';
 import { decodeSetup, groupTrace, filterTrace } from './trace';
 import { applyRecord, createState, hostEvent, type ProtocolRecord } from './protocol';

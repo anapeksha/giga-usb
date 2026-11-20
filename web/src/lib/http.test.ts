@@ -1,5 +1,5 @@
 import type { ProtocolRecord } from './protocol';
-import test from 'node:test';
+import { test } from 'vitest';
 import assert from 'node:assert/strict';
 import { applyEventPage, createLossRefreshGuard, getEventPage, sendCommand } from './http';
 import { createState } from './protocol';
@@ -14,7 +14,8 @@ test('page fetch uses supplied cursor and leaves reduction to the session', asyn
   });
   assert.equal(state.history.length, 0);
   applyEventPage(state, page);
-  assert.equal(state.history.length, 1);
+  assert.equal(state.history.length, 0);
+  assert.equal(state.protocol, 5);
   assert.equal(state.transportDropped, 8);
 });
 

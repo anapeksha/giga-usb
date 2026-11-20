@@ -1,4 +1,4 @@
-import test from 'node:test';
+import { test } from 'vitest';
 import assert from 'node:assert/strict';
 import { appendFileChunk, DOWNLOAD_LIMIT } from './storage';
 const file = { index: 1, name: 'TEST.TXT', size: 129, directory: false };
