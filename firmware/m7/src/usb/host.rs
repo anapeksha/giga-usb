@@ -611,6 +611,10 @@ impl<'d> Host<'d> {
             // Cleanup must also work after Stop/Reset/disconnect: do not use pause.
             self.service();
             if Instant::now() >= end {
+                // Hardware may finish halting while service() processes commands.
+                if pac::USB_OTG_HS.hcchar(0).read().0 & ENABLE == 0 {
+                    return Ok(());
+                }
                 self.channel_snapshot(if requested {
                     "halt timeout"
                 } else {
