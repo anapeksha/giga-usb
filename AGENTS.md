@@ -369,6 +369,15 @@ zero USB errors and the host stopped. Evidence is in
 `target/latest-flash-status.jsonl`. This startup check does not validate USB
 activity, on-board HTTP transfer/browser rendering or resolve the earlier fault.
 
+Images built from `26d776b`, including the virtualized trace, bounded event
+batches, device identification and scrollable details, were flashed M4 then M7,
+verified and system-reset. Frontend checks passed with 35 unit tests and 31
+Playwright tests; both logging-enabled release builds passed. USB-C startup
+status reported AP mode at `192.168.4.1`, no network error, zero USB errors and
+the host stopped. Evidence is in `target/virtualized-ui-flash-status.jsonl`.
+This does not establish on-board browser rendering, USB activity or resolution
+of the earlier controller fault.
+
 ### Routes
 
 | Route | Request | Response |
