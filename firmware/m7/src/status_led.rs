@@ -22,7 +22,7 @@ pub async fn run(
             Rgb::Blue => Color::Blue,
             Rgb::Yellow => Color::Yellow,
             Rgb::Cyan => Color::Cyan,
-            Rgb::Magenta => Color::Magenta,
+
             Rgb::White => Color::White,
         };
         led.set(color).unwrap();

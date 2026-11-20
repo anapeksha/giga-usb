@@ -219,17 +219,22 @@ ELF. RTT is nonblocking; `panic-halt` does not emit a panic report.
 
 | Indication | Meaning |
 | --- | --- |
-| Slow white pulse | Starting the network services |
-| Blue double pulse | GigaUSB AP available |
+| Slow white pulse | Starting AP/network services while the USB host is stopped |
+| Blue double pulse | GigaUSB AP available, USB host stopped |
 | Short yellow pulse | Host enabled, waiting for a USB device |
 | Fast yellow blink | USB attachment/enumeration |
 | Steady green | USB ready |
-| Brief cyan flash | A USB packet completed successfully |
+| Brief cyan flash | A USB packet completed successfully while ready |
+| Red triple pulse | USB fault or AP/network error |
 
-| Red triple pulse | USB fault or network error |
-
-Priority is fault, enumeration, USB activity, network startup/AP, then USB
-ready/waiting or idle. The AP therefore remains blue between USB activity flashes.
+Priority is fault, enumeration, USB activity, USB ready/waiting, then AP startup
+or AP available with the host stopped. The running AP must not hide USB states:
+ready returns to steady green after each 80 ms cyan activity indication; waiting
+uses a 150 ms yellow pulse every second. Enumeration blinks yellow every 200 ms.
+With the host stopped, AP availability uses two 100 ms blue pulses in a two-second
+cycle; startup uses a 500 ms white pulse in that cycle. Faults use three 100 ms
+red pulses in a two-second cycle. There are no station join/connected or credential
+write patterns. AP availability is not a browser-connection or HTTP-success signal.
 Patterns are on/off RGB combinations, not PWM fades. The LED is informational;
 use dashboard/USB-C diagnostics for the exact state and failure reason.
 

@@ -42,12 +42,13 @@ impl Bus {
     }
     pub fn set_network(&self, info: NetworkInfo) {
         let mut state = self.0.borrow_mut();
-        state.led.network = Some(match info.mode.as_str() {
-            "setup" => NetworkMode::Setup,
-            "connected" => NetworkMode::Connected,
-            "error" => NetworkMode::Error,
-            _ => NetworkMode::Connecting,
-        });
+        state.led.network = if info.error.is_some() || info.mode.as_str() == "error" {
+            Some(NetworkMode::Error)
+        } else if info.mode.as_str() == "setup" && info.ip.is_some() {
+            Some(NetworkMode::AccessPoint)
+        } else {
+            None
+        };
         state.network = Some(info);
     }
 
@@ -164,7 +165,7 @@ mod tests {
             error: None,
         };
         bus.set_network(setup.clone());
-        assert_eq!(bus.led_snapshot().network, Some(NetworkMode::Setup));
+        assert_eq!(bus.led_snapshot().network, Some(NetworkMode::AccessPoint));
         assert!(bus.command(HostCommand::Status));
         assert_eq!(bus.next_command(), Some(HostCommand::Status));
         let current = bus.network().unwrap();
@@ -179,6 +180,33 @@ mod tests {
         });
         assert_eq!(bus.led_snapshot().network, Some(NetworkMode::Error));
         assert!(bus.network().unwrap().error.is_some());
+    }
+
+    #[test]
+    fn ap_led_requires_an_address_and_no_network_error() {
+        let bus = Bus::new();
+        let mut info = NetworkInfo {
+            mode: String::try_from("setup").unwrap(),
+            mac: [0; 6],
+            ip: None,
+            error: None,
+        };
+        bus.set_network(info.clone());
+        assert_eq!(bus.led_snapshot().network, None);
+        info.ip = Some(String::try_from("192.168.4.1").unwrap());
+        bus.set_network(info.clone());
+        assert_eq!(bus.led_snapshot().network, Some(NetworkMode::AccessPoint));
+        info.error = Some(String::try_from("Network unavailable").unwrap());
+        bus.set_network(info.clone());
+        assert_eq!(bus.led_snapshot().network, Some(NetworkMode::Error));
+        info.error = None;
+        bus.set_network(info.clone());
+        assert_eq!(bus.led_snapshot().network, Some(NetworkMode::AccessPoint));
+        for mode in ["connecting", "connected"] {
+            info.mode = String::try_from(mode).unwrap();
+            bus.set_network(info.clone());
+            assert_eq!(bus.led_snapshot().network, None);
+        }
     }
 
     #[test]
