@@ -10,19 +10,29 @@ import { cn } from '~/lib/utils';
 type CheckboxRootProps<T extends ValidComponent = 'div'> = Omit<
   CheckboxPrimitive.CheckboxRootProps<T>,
   'children'
-> & { class?: string | undefined; children?: JSX.Element };
+> & { class?: string | undefined; children?: JSX.Element; destructive?: boolean };
 
 const Checkbox = <T extends ValidComponent = 'div'>(
   props: PolymorphicProps<T, CheckboxRootProps<T>>,
 ) => {
-  const [local, others] = splitProps(props as CheckboxRootProps, ['class', 'children']);
+  const [local, others] = splitProps(props as CheckboxRootProps, [
+    'class',
+    'children',
+    'destructive',
+  ]);
   return (
     <CheckboxPrimitive.Root
       class={cn('group relative flex items-center gap-2', local.class)}
       {...others}
     >
       <CheckboxPrimitive.Input class="peer" />
-      <CheckboxPrimitive.Control class="size-4 shrink-0 rounded-sm border border-primary ring-offset-background disabled:cursor-not-allowed disabled:opacity-50 peer-focus-visible:outline-none peer-focus-visible:ring-2 peer-focus-visible:ring-ring peer-focus-visible:ring-offset-2 data-checked:border-none data-indeterminate:border-none data-checked:bg-primary data-indeterminate:bg-primary data-checked:text-primary-foreground data-indeterminate:text-primary-foreground">
+      <CheckboxPrimitive.Control
+        class={cn(
+          local.destructive &&
+            'border-destructive! data-checked:border-destructive! data-checked:bg-destructive! data-checked:text-destructive-foreground! peer-focus-visible:ring-destructive!',
+          'size-4 shrink-0 rounded-sm border border-primary ring-offset-background disabled:cursor-not-allowed disabled:opacity-50 peer-focus-visible:outline-none peer-focus-visible:ring-2 peer-focus-visible:ring-ring peer-focus-visible:ring-offset-2 data-checked:border-none data-indeterminate:border-none data-checked:bg-primary data-indeterminate:bg-primary data-checked:text-primary-foreground data-indeterminate:text-primary-foreground',
+        )}
+      >
         <CheckboxPrimitive.Indicator>
           <Switch>
             <Match when={!others.indeterminate}>
