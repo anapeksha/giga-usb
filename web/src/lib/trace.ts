@@ -59,7 +59,14 @@ export function groupTrace(records: ProtocolRecord[]): TraceGroup[] {
     }
     const context = pending;
     pending = undefined;
-    if (p?.[0] === 'transfer' && context && context.endpoint === p[1].endpoint) {
+    if (
+      p?.[0] === 'transfer' &&
+      context &&
+      context.endpoint === p[1].endpoint &&
+      (r.sequence === undefined ||
+        records[i - 1].sequence === undefined ||
+        r.sequence === records[i - 1].sequence! + 1)
+    ) {
       result.pop();
       const key = `${context.session_id}:${context.transfer_id}:${context.kind}`;
       let group = groups.get(key);

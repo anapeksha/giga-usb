@@ -133,11 +133,14 @@ export type RecordEvent =
   | { type: 'error'; message: string }
   | { type: 'dropped'; count: number };
 export interface ProtocolRecord {
+  /** Browser arrival order, including events omitted from USB history. */
+  sequence?: number;
   timestamp_ms: number;
   event: RecordEvent;
 }
 export interface ProtocolState {
   history: ProtocolRecord[];
+  recordSequence: number;
   network?: NetworkInfo;
   lifecycle: Lifecycle | null;
   session: number | null;
@@ -415,6 +418,7 @@ export function validRecord(r: unknown): r is ProtocolRecord {
 export function createState(): ProtocolState {
   return {
     history: [],
+    recordSequence: 0,
     lifecycle: null,
     session: null,
     diagnostic: null,
@@ -451,10 +455,18 @@ function clearDevice(s: ProtocolState) {
   s.address = null;
   s.speed = null;
 }
+// Generic processor/network errors have no reliable USB scope. Typed host errors do.
+export function isUsbTraceRecord(r: ProtocolRecord): boolean {
+  const p = r.event.type === 'host' ? hostEvent(r.event.event) : null;
+  return !!p && ['transfer', 'transfer_context', 'diagnostic', 'error'].includes(p[0]);
+}
 export function applyRecord(s: ProtocolState, r: unknown): boolean {
   if (!validRecord(r)) return false;
-  s.history.push(r);
-  if (s.history.length > HISTORY_LIMIT) s.history.shift();
+  s.recordSequence++;
+  if (isUsbTraceRecord(r)) {
+    s.history.push({ ...r, sequence: s.recordSequence });
+    if (s.history.length > HISTORY_LIMIT) s.history.shift();
+  }
   const e = r.event;
   switch (e.type) {
     case 'hello':

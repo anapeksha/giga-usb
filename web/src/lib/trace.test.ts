@@ -1,7 +1,7 @@
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
 import { decodeSetup, groupTrace, filterTrace } from './trace';
-import { applyRecord, createState, hostEvent, type ProtocolRecord } from './protocol';
+import { applyRecord, createState, hostEvent, summary, type ProtocolRecord } from './protocol';
 const record = (event: unknown) =>
   ({ timestamp_ms: 1, event: { type: 'host', event } }) as ProtocolRecord;
 const context = {
@@ -17,6 +17,14 @@ const setup = [128, 6, 0, 1, 0, 0, 18, 0];
 const packet = record({
   transfer: { endpoint: 0, direction: 'out', pid: 3, bytes: 8, data: setup },
 });
+test('normal summaries omit packet encoding while raw records retain it', () => {
+  const packet = record({
+    transfer: { direction: 'in', endpoint: 129, bytes: 2, pid: 2, data: [1, 2] },
+  });
+  assert.equal(summary(packet), 'Received · endpoint 129');
+  assert.match(JSON.stringify(packet), /"pid":2/);
+});
+
 test('standard, HID and storage requests; truncated request', () => {
   assert.match(decodeSetup(setup), /Get descriptor/);
   assert.match(decodeSetup([161, 1, 0, 0, 0, 0, 8, 0]), /Get report/);
@@ -120,4 +128,58 @@ test('lifecycle preserves partial topology on error/status and resets on new ses
     applyRecord(s, record({ lifecycle: { state, session_id: 2 } }));
     assert.equal(s.lifecycle, state);
   }
+});
+
+test('non-USB floods update state without consuming USB history or export', () => {
+  const s = createState();
+  applyRecord(s, packet);
+  for (let i = 0; i < 700; i++) {
+    applyRecord(
+      s,
+      record({
+        network: {
+          info: { mode: 'setup', mac: [0, 1, 2, 3, 4, 5], ip: '192.168.4.1', error: null },
+        },
+      }),
+    );
+    applyRecord(s, record({ lifecycle: { state: 'ready', session_id: 1 } }));
+    applyRecord(s, record('ready'));
+    applyRecord(
+      s,
+      record({
+        status: { enabled: true, attached: true, address: 1, transfers: 20, errors: 2, dropped: 3 },
+      }),
+    );
+  }
+  applyRecord(s, { timestamp_ms: 1, event: { type: 'error', message: 'Processor error' } });
+  applyRecord(s, { timestamp_ms: 1, event: { type: 'dropped', count: 4 } });
+  applyRecord(s, record({ storage_error: { message: 'No file' } }));
+  assert.equal(s.history.length, 1);
+  assert.equal(s.history[0].event, packet.event);
+  assert.equal(s.network?.ip, '192.168.4.1');
+  assert.equal(s.lifecycle, 'ready');
+  assert.equal(s.address, 1);
+  assert.equal(s.transfers, 20);
+  assert.equal(s.errors, 3);
+  assert.equal(s.queueDropped, 4);
+  assert.equal(s.storageError, 'No file');
+  const exported = JSON.parse(JSON.stringify(s.history)) as ProtocolRecord[];
+  assert.equal(exported.length, 1);
+  assert.deepEqual(exported[0].event, packet.event);
+  applyRecord(s, record({ error: { code: 'stall' } }));
+  assert.equal(s.history.length, 2);
+});
+
+test('omitted non-USB records break context pairing across pages and JSON export', () => {
+  const s = createState();
+  applyRecord(s, record({ transfer_context: context }));
+  applyRecord(s, record('ready'));
+  applyRecord(s, packet);
+  assert.equal(groupTrace(s.history).length, 2);
+  assert.equal(groupTrace(JSON.parse(JSON.stringify(s.history))).length, 2);
+  applyRecord(s, record({ transfer_context: context }));
+  applyRecord(s, packet);
+  const groups = groupTrace(s.history);
+  assert.equal(groups.length, 3);
+  assert.equal(groups[2].records.length, 2);
 });

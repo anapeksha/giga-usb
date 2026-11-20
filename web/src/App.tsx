@@ -1,4 +1,10 @@
 import { For, Show } from 'solid-js';
+import {
+  Accordion,
+  AccordionItem,
+  AccordionTrigger,
+  AccordionContent,
+} from './components/ui/accordion';
 import { createHttpController, type Command } from './http';
 import { Button } from './components/ui/button';
 import { Card, CardContent } from './components/ui/card';
@@ -31,6 +37,7 @@ export default function App() {
           </Button>
         </div>
       </header>
+
       <Card>
         <CardContent class="p-5">
           <div class="flex flex-wrap items-center justify-between gap-5">
@@ -133,15 +140,19 @@ export default function App() {
             <CardContent class="p-5">
               <h2>Last failure</h2>
               <p>{failure().code.replaceAll('_', ' ')}</p>
-              <details>
-                <summary>Technical details</summary>
-                <p class="text-sm text-muted-foreground">
-                  Stage: {failure().stage} · Elapsed: {failure().elapsed_us.toLocaleString()} µs ·
-                  Retries: {failure().retries.toLocaleString()}
-                </p>
-                <p>{decodeSetup(failure().setup)}</p>
-                <pre>{JSON.stringify(failure(), null, 2)}</pre>
-              </details>
+              <Accordion collapsible>
+                <AccordionItem value="failure">
+                  <AccordionTrigger>Technical details</AccordionTrigger>
+                  <AccordionContent>
+                    <p class="text-sm text-muted-foreground">
+                      Stage: {failure().stage} · Elapsed: {failure().elapsed_us.toLocaleString()} µs
+                      · Retries: {failure().retries.toLocaleString()}
+                    </p>
+                    <p>{decodeSetup(failure().setup)}</p>
+                    <pre>{JSON.stringify(failure(), null, 2)}</pre>
+                  </AccordionContent>
+                </AccordionItem>
+              </Accordion>
             </CardContent>
           </Card>
         )}
@@ -156,12 +167,17 @@ export default function App() {
                 {(storage().blocks * storage().block_size).toLocaleString()} bytes
               </p>
               <p class="text-sm text-muted-foreground">Read-only files</p>
-              <details class="my-3">
-                <summary>Storage details</summary>
-                <p>
-                  FAT32 root only · up to 32 entries · files up to 64 KiB · no subfolders or writes.
-                </p>
-              </details>
+              <Accordion collapsible>
+                <AccordionItem value="storage">
+                  <AccordionTrigger>Storage details</AccordionTrigger>
+                  <AccordionContent>
+                    <p>
+                      FAT32 root only · up to 32 entries · files up to 64 KiB · no subfolders or
+                      writes.
+                    </p>
+                  </AccordionContent>
+                </AccordionItem>
+              </Accordion>
               <Button
                 disabled={
                   !storage().fat32 || !http.connected() || !state().attached || http.downloading()

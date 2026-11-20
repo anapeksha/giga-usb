@@ -9,7 +9,6 @@ import {
   summary,
 } from './protocol';
 const record = (event: unknown) => ({ timestamp_ms: 42, event });
-const hello = record({ type: 'hello', protocol_version: PROTOCOL_VERSION });
 test('protocol version is 9', () => {
   assert.equal(PROTOCOL_VERSION, 9);
   const golden = JSON.parse('{"timestamp_ms":42,"event":{"type":"hello","protocol_version":9}}');
@@ -30,10 +29,10 @@ test('network JSON golden retains diagnostics without changing USB state', () =>
   assert.equal(applyRecord(state, golden), true);
   assert.deepEqual(state.network, golden.event.event.network.info);
   assert.deepEqual(
-    { ...state, history: [], network: undefined },
-    { ...before, network: undefined },
+    { ...state, recordSequence: 0, history: [], network: undefined },
+    { ...before, recordSequence: 0, network: undefined },
   );
-  assert.deepEqual(state.history.at(-1), golden);
+  assert.equal(state.history.length, 1);
   assert.equal(summary(golden), 'Network · connected · 192.168.4.1');
 
   for (const mode of ['setup', 'associating', 'link_wait', 'dhcp', 'connected', 'error']) {
@@ -208,7 +207,7 @@ test('protocol 6 raw setup golden and complete bounded packets', () => {
     const packet = record({ type: 'host', event: { transfer } });
     assert.equal(applyRecord(state, packet), true);
     assert.ok(Buffer.byteLength(JSON.stringify(packet)) <= 1024);
-    assert.deepEqual(state.history.at(-1), packet);
+    assert.deepEqual(state.history.at(-1), { ...packet, sequence: state.recordSequence });
   }
   assert.equal(state.transfers, 5);
   assert.equal(state.keyboard, null); // Raw packets do not duplicate semantic HID decoding.
@@ -240,7 +239,11 @@ test('protocol 6 raw setup golden and complete bounded packets', () => {
 
 test('history is a bounded 500-record ring and fresh sessions are empty', () => {
   const s = createState();
-  for (let i = 0; i < 700; i++) applyRecord(s, { ...hello, timestamp_ms: i });
+  for (let i = 0; i < 700; i++)
+    applyRecord(s, {
+      timestamp_ms: i,
+      event: { type: 'host', event: { error: { code: 'stall' } } },
+    });
   assert.equal(s.history.length, HISTORY_LIMIT);
   assert.equal(s.history[0].timestamp_ms, 200);
   assert.equal(s.history.at(-1)?.timestamp_ms, 699);
