@@ -19,6 +19,7 @@ import {
 export type { Command } from './lib/http';
 
 const message = (error: unknown) => (error instanceof Error ? error.message : String(error));
+const MAX_EVENT_PAGES = 8;
 let nextSession = 0;
 
 export function createHttpController() {
@@ -82,8 +83,8 @@ export function createHttpController() {
       const current = session;
       if (!current) throw new Error('Disconnected');
       try {
-        let count: number;
-        do {
+        // Bound catch-up work even when the board continuously returns full pages.
+        for (let pageIndex = 0; pageIndex < MAX_EVENT_PAGES; pageIndex++) {
           const page = await getEventPage(cursor, signal);
           if (session !== current || current.signal.aborted) throw new Error('Disconnected');
           if (
@@ -104,12 +105,13 @@ export function createHttpController() {
             if (!notice().error) notify('Connected.', false, false);
           }
           if (refreshGuard(page.dropped)) refreshStatus(current);
-          if (!paused()) publish();
-          count = page.records.length;
-        } while (count === 3 && !signal.aborted);
+          if (page.records.length < 3 || signal.aborted) break;
+        }
+        if (!paused()) publish();
         return { cursor };
       } catch (error) {
         if (session === current && !signal.aborted) {
+          if (!paused()) publish();
           notify(`Connection failed: ${message(error)} Click Connect to retry.`, true);
           disconnect();
         }
