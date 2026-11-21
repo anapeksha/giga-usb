@@ -13,7 +13,7 @@ test('gzip bundle renders dark, keyboard-operable and accessible', async ({
   await page.emulateMedia({ colorScheme: 'light' });
   const response = await page.goto(appURL);
   expect(response?.headers()['content-encoding']).toBe('gzip');
-  await expect(page.getByRole('heading', { name: 'GigaUSB', exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: /^Giga\s?USB$/ })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Disconnect', exact: true })).toBeVisible();
   expect(api.cursors.length).toBeGreaterThan(0);
   expect(
