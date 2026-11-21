@@ -1,0 +1,41 @@
+name: Bug report
+description: Report a reproducible GigaUSB defect.
+body:
+  - type: markdown
+    attributes:
+      value: "Share sanitized evidence only. Do not upload sensitive USB captures, keystrokes, credentials or keys. Completed host transactions are not passive wire captures."
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should happen?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened, including exact errors and impact?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Include commands or actions, frequency and any safe workaround.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Commit/image versions; board, power and probe; USB device VID/PID/model/speed; client OS/browser or tool versions, as applicable.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Validation and evidence
+      description: Separate software checks from hardware observations. Record commands/results and sanitized diagnostics. Distinguish flash verification, HTTP transfer, browser rendering and USB operation; mark untested checks NOT RUN. Keep host, M4 and browser loss counters separate.
+    validations:
+      required: true

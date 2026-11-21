@@ -1,0 +1,27 @@
+name: Feature request
+description: Propose a focused improvement to GigaUSB.
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What USB host or diagnostic need is unmet? Describe the use case and current workaround.
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Proposed scope
+      description: Describe the desired behavior, boundaries and explicit non-goals. Note relevant hardware or protocol constraints.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: What other approaches have you considered?
+  - type: textarea
+    id: validation
+    attributes:
+      label: Acceptance and validation
+      description: What would demonstrate success? Separate software tests from hardware evidence needed; identify unavailable devices or checks that would remain NOT RUN. Do not include sensitive captures, input, credentials or keys.
