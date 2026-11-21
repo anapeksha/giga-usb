@@ -3,4 +3,5 @@
 
 #[cfg(target_os = "none")]
 pub mod boot;
+pub mod ui_bus;
 pub mod usb;
