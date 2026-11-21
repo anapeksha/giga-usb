@@ -14,8 +14,8 @@ use embassy_time::{Duration, Instant, Timer};
 use heapless::{Deque, Vec};
 
 use super::host_logic::{
-    Packet, SelectedConfig, channel_outcome, queue_capture, root_channel_characteristics,
-    select_configuration,
+    Packet, SelectedConfig, channel_outcome, halt_outcome, queue_capture,
+    root_channel_characteristics, select_configuration,
 };
 use super::types::{
     CapturedEvent, DESCRIPTOR_CHUNK_SIZE, Direction, HostCommand, HostState, MAX_DESCRIPTOR_SIZE,
@@ -571,16 +571,29 @@ impl<'d> Host<'d> {
     }
 
     async fn halt(&mut self) -> Result<(), UsbError> {
-        if pac::USB_OTG_HS.hcchar(0).read().0 & ENABLE == 0 {
-            return Ok(());
-        }
         let end = Instant::now() + Duration::from_millis(10);
         let mut requested = false;
-        while pac::USB_OTG_HS.hcchar(0).read().0 & ENABLE != 0 {
+        loop {
+            self.service();
             self.drain_abandoned_rx();
             let characteristics = pac::USB_OTG_HS.hcchar(0).read().0;
-            if characteristics & ENABLE == 0 {
-                break;
+            let port = pac::USB_OTG_HS.hprt().read().0;
+            if let Some(outcome) = halt_outcome(
+                characteristics,
+                port,
+                pac::USB_OTG_HS.gintsts().read().0,
+                Instant::now() >= end,
+            ) {
+                if outcome == Err(UsbError::Controller) {
+                    self.channel_snapshot(if port & (1 << 4) != 0 {
+                        "halt overcurrent"
+                    } else if requested {
+                        "halt timeout"
+                    } else {
+                        "halt queue timeout"
+                    });
+                }
+                return outcome;
             }
             // DWC2 slave-mode disable consumes a request queue entry. As in
             // TinyUSB channel_disable(), wait for the appropriate queue first,
@@ -597,23 +610,9 @@ impl<'d> Host<'d> {
                     .write_value(regs::Hcchar(characteristics | ENABLE | HALT));
                 requested = true;
             }
-            // Cleanup must also work after Stop/Reset/disconnect: do not use pause.
-            self.service();
-            if Instant::now() >= end {
-                // Hardware may finish halting while service() processes commands.
-                if pac::USB_OTG_HS.hcchar(0).read().0 & ENABLE == 0 {
-                    return Ok(());
-                }
-                self.channel_snapshot(if requested {
-                    "halt timeout"
-                } else {
-                    "halt queue timeout"
-                });
-                return Err(UsbError::Controller);
-            }
+            // Cleanup must also work after Stop/Reset: do not use pause.
             Timer::after_micros(100).await;
         }
-        Ok(())
     }
 
     async fn prepare_out(&mut self, length: usize, deadline: Instant) -> Result<(), UsbError> {
@@ -1326,11 +1325,22 @@ impl<'d> Host<'d> {
                 (port & !(PORT_CHANGES | 4)) | (port & PORT_CHANGES),
             ));
             if !self.connected() {
-                if let Err(error) = self.halt().await {
-                    self.error(error);
-                    self.enabled = false;
-                    self.vbus.set_low();
-                    continue;
+                match self.halt().await {
+                    Ok(()) => {}
+                    Err(UsbError::Disconnected) => {
+                        // The port vanished with a live channel. initialize()
+                        // resets HS before any channel registers can be reused.
+                        self.port(1 << 12, 0);
+                        self.vbus.set_low();
+                        initialized = false;
+                        Timer::after_millis(100).await;
+                    }
+                    Err(error) => {
+                        self.error(error);
+                        self.enabled = false;
+                        self.vbus.set_low();
+                        continue;
+                    }
                 }
                 self.detached();
                 failed_device = false;

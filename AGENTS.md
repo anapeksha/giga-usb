@@ -534,6 +534,27 @@ no network error, zero USB errors and the host stopped. Evidence is in
 `target/ap-led-flash-status.jsonl`. Physical observation of every LED pattern,
 USB activity and on-board browser validation were not performed in this run.
 
+### Red-LED disconnect cleanup investigation — 2026-11-21
+
+USB-C status from the running image reported session 6 in error, host disabled
+but still attached, 205 completed transfers, one USB error and zero capture drops.
+AP status remained `192.168.4.1` with no network error. The saved endpoint `0x83`
+diagnostic had `elapsed_us=10220`, HCINT `0`, HCCHAR `0x805C9840`, HCTSIZ
+`0x00080040` and HPRT `0x00021008`. HPRT connection and enable bits were clear;
+overcurrent was not asserted. Evidence: `target/red-blink-status.jsonl`.
+A bounded non-resetting RTT attachment yielded no retained diagnostic output.
+
+The driver could replace a disconnect with a controller error when cleanup
+could not halt the channel. Halt classification now recognizes a disconnected
+active channel before its timeout, and teardown powers off and invalidates
+initialization so the next activation RCC-resets HS before channel reuse.
+Idle channels need no extra halt; connected halt deadlines and overcurrent errors
+are preserved. Five native regressions include the actual saved registers and
+a latched disconnect during fast reconnect. All 57 M7 tests, Rust formatting,
+M7 release Clippy and builds with/without logging passed. This patch has not
+been flashed or hardware-tested. The initiating disconnect/link loss and any
+separate connected-port halt fault remain unproven; do not call them resolved.
+
 ### Routes
 
 | Route | Request | Response |

@@ -96,6 +96,27 @@ impl Packet {
     }
 }
 
+/// A disconnected port may never retire an active slave-mode channel. Its
+/// caller must reset the controller before reuse, not report a halt timeout.
+pub(super) fn halt_outcome(
+    hcchar: u32,
+    hprt: u32,
+    gintsts: u32,
+    expired: bool,
+) -> Option<Result<(), UsbError>> {
+    if hprt & (1 << 4) != 0 {
+        Some(Err(UsbError::Controller))
+    } else if hcchar & (1 << 31) == 0 {
+        Some(Ok(()))
+    } else if hprt & 1 == 0 || gintsts & (1 << 29) != 0 {
+        Some(Err(UsbError::Disconnected))
+    } else if expired {
+        Some(Err(UsbError::Controller))
+    } else {
+        None
+    }
+}
+
 /// Poll raw HCINT without mistaking the normal completion halt for an error.
 /// RXFLVL may become visible after the caller's last FIFO drain. Keep polling
 /// on XFRC until all receive statuses (including the payload) have been popped.
@@ -539,6 +560,53 @@ mod tests {
             };
             assert_eq!(packet.transfer_size(0), 64 | (1 << 19) | (pid << 29));
             assert_eq!((root_channel_characteristics(packet, 1, 0) >> 18) & 3, 2);
+        }
+    }
+
+    #[test]
+    fn disconnected_active_channel_is_not_a_controller_timeout() {
+        // Actual register values from the endpoint 0x83 failure.
+        for expired in [false, true] {
+            assert_eq!(
+                halt_outcome(0x805c_9840, 0x0002_1008, 0, expired),
+                Some(Err(UsbError::Disconnected))
+            );
+        }
+    }
+
+    #[test]
+    fn disconnect_latch_prevents_reuse_after_a_fast_reconnect() {
+        assert_eq!(
+            halt_outcome(1 << 31, 1, 1 << 29, false),
+            Some(Err(UsbError::Disconnected))
+        );
+    }
+
+    #[test]
+    fn connected_channel_keeps_its_halt_deadline() {
+        for characteristics in [1 << 31, (1 << 31) | (1 << 30)] {
+            assert_eq!(halt_outcome(characteristics, 1, 0, false), None);
+            assert_eq!(
+                halt_outcome(characteristics, 1, 0, true),
+                Some(Err(UsbError::Controller))
+            );
+        }
+        // Completion at the deadline wins over timeout.
+        assert_eq!(halt_outcome(0, 1, 0, true), Some(Ok(())));
+    }
+
+    #[test]
+    fn idle_disconnected_channel_needs_no_halt_request() {
+        assert_eq!(halt_outcome(0, 0, 1 << 29, true), Some(Ok(())));
+    }
+
+    #[test]
+    fn overcurrent_is_not_hidden_by_disconnect_or_channel_completion() {
+        for characteristics in [0, 1 << 31] {
+            assert_eq!(
+                halt_outcome(characteristics, 1 << 4, 1 << 29, false),
+                Some(Err(UsbError::Controller))
+            );
         }
     }
 
