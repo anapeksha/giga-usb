@@ -71,6 +71,7 @@ test('connecting can be cancelled while requests are pending', async ({ page, ap
     await expect(region).toHaveAttribute('aria-busy', 'false');
     await expect(region.locator('[aria-hidden="true"]')).toHaveCount(0);
   }
+  await expect(page.getByRole('status').filter({ hasText: /^Loading / })).toHaveCount(0);
   api.pending = false;
   await page.getByRole('button', { name: 'Connect', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Disconnect', exact: true })).toBeVisible();
@@ -99,6 +100,13 @@ for (const status of [202, 503]) {
       await expect(region).toHaveAttribute('aria-busy', 'true');
       await expect(region.locator('[aria-hidden="true"]').first()).toBeVisible();
     }
+    for (const text of [
+      'Loading device details…',
+      'Loading diagnostics and storage…',
+      'Loading USB trace…',
+    ])
+      await expect(page.getByRole('status').filter({ hasText: text })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Start', exact: true })).toBeVisible();
     await expect(connected).toHaveCount(0);
     if (status === 503) {
       await expect(
@@ -115,6 +123,7 @@ for (const status of [202, 503]) {
       await expect(region.locator('[aria-hidden="true"]')).toHaveCount(0);
     }
     await expect(page.getByText('Connected', { exact: true })).toBeVisible();
+    await expect(page.getByRole('status').filter({ hasText: /^Loading / })).toHaveCount(0);
     const polls = api.cursors.length;
     await page.waitForTimeout(300);
     expect(api.cursors).toHaveLength(polls);

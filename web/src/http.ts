@@ -1,5 +1,5 @@
 import { createQuery, createMutation, useQueryClient } from '@tanstack/solid-query';
-import { batch, createSignal, onCleanup, onMount } from 'solid-js';
+import { batch, createResource, createSignal, onCleanup, onMount } from 'solid-js';
 import { toast } from 'solid-sonner';
 import { appendFileChunk } from './lib/storage';
 import { createState, hostEvent, type ProtocolRecord, type HostPayloads } from './lib/protocol';
@@ -36,6 +36,19 @@ export function createHttpController() {
   let refreshGuard = createLossRefreshGuard();
   const [sessionId, setSessionId] = createSignal(0);
   const [active, setActive] = createSignal(false);
+  let readiness: { current: AbortController; resolve: () => void } | undefined;
+  const settleReadiness = (current: AbortController | null) => {
+    if (readiness?.current !== current) return;
+    readiness?.resolve();
+    readiness = undefined;
+  };
+  const [ready] = createResource(sessionId, () => {
+    const current = session;
+    if (!current) return;
+    return new Promise<void>((resolve) => {
+      readiness = { current, resolve };
+    });
+  });
   const [snapshot, setSnapshot] = createSignal(structuredClone(state));
   const [connected, setConnected] = createSignal(false);
   const [paused, setPaused] = createSignal(false);
@@ -158,6 +171,7 @@ export function createHttpController() {
             setStreamError('');
             if (refreshGuard(page.dropped)) refreshStatus(current);
             if (!paused()) publish();
+            settleReadiness(current);
           },
           onTrace: (page) => {
             ensureCurrent();
@@ -195,6 +209,7 @@ export function createHttpController() {
   function disconnect() {
     clearTimeout(traceSearchTimer);
     setTraceDebouncing(false);
+    settleReadiness(session);
     session?.abort();
     session = null;
     setActive(false);
@@ -310,7 +325,10 @@ export function createHttpController() {
   onMount(connect);
   onCleanup(disconnect);
   return {
-    snapshot,
+    snapshot: () => {
+      ready();
+      return snapshot();
+    },
     traceFilters,
     filteredRecords,
     traceDropped,

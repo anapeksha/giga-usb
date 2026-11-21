@@ -1,4 +1,4 @@
-import { For, Show } from 'solid-js';
+import { For, Show, Suspense } from 'solid-js';
 import {
   Accordion,
   AccordionItem,
@@ -93,8 +93,7 @@ export default function App() {
             <div>
               <dt>Peripheral</dt>
               <dd>
-                <Show
-                  when={!http.isLoading()}
+                <Suspense
                   fallback={
                     <Skeleton
                       aria-hidden="true"
@@ -104,19 +103,18 @@ export default function App() {
                     />
                   }
                 >
-                  {!http.connected()
+                  {!state().attached && !http.connected()
                     ? 'Connect to view'
                     : state().attached
                       ? `Attached${state().speed ? ` · ${state().speed} speed` : ''}`
                       : 'No device reported'}
-                </Show>
+                </Suspense>
               </dd>
             </div>
             <div>
               <dt>Host</dt>
               <dd>
-                <Show
-                  when={!http.isLoading()}
+                <Suspense
                   fallback={
                     <Skeleton
                       aria-hidden="true"
@@ -129,14 +127,13 @@ export default function App() {
                   {state().lifecycle
                     ? state().lifecycle!.charAt(0).toUpperCase() + state().lifecycle!.slice(1)
                     : 'Unknown'}
-                </Show>
+                </Suspense>
               </dd>
             </div>
             <div>
               <dt>Address</dt>
               <dd>
-                <Show
-                  when={!http.isLoading()}
+                <Suspense
                   fallback={
                     <Skeleton
                       aria-hidden="true"
@@ -147,7 +144,7 @@ export default function App() {
                   }
                 >
                   {state().address ?? '—'}
-                </Show>
+                </Suspense>
               </dd>
             </div>
           </dl>
@@ -195,8 +192,7 @@ export default function App() {
               <CardContent class="p-4">
                 <p class="text-xs text-muted-foreground">{counter.label}</p>
                 <p class="my-2 font-mono text-2xl tabular-nums">
-                  <Show
-                    when={!http.isLoading()}
+                  <Suspense
                     fallback={
                       <Skeleton
                         as="span"
@@ -208,127 +204,133 @@ export default function App() {
                     }
                   >
                     {state()[counter.key].toLocaleString()}
-                  </Show>
+                  </Suspense>
                 </p>
               </CardContent>
             </Card>
           )}
         </For>
       </section>
-      <div class="grid items-start gap-5 lg:grid-cols-[minmax(0,2fr)_minmax(280px,1fr)]">
-        <Topology state={state()} />
-        <Hid state={state()} />
-      </div>
-      <Show when={state().diagnostic}>
-        {(failure) => (
-          <Card class="mt-5">
-            <CardContent class="p-5">
-              <h2>Last failure</h2>
-              <p>{failure().code.replaceAll('_', ' ')}</p>
-              <Accordion collapsible>
-                <AccordionItem value="failure">
-                  <AccordionTrigger>Technical details</AccordionTrigger>
-                  <AccordionContent>
-                    <p class="text-sm text-muted-foreground">
-                      Stage: {failure().stage} · Elapsed: {failure().elapsed_us.toLocaleString()} µs
-                      · Retries: {failure().retries.toLocaleString()}
-                    </p>
-                    <p>{decodeSetup(failure().setup)}</p>
-                    <pre>{JSON.stringify(failure(), null, 2)}</pre>
-                  </AccordionContent>
-                </AccordionItem>
-              </Accordion>
-            </CardContent>
-          </Card>
-        )}
-      </Show>
-      <Show when={state().storage}>
-        {(storage) => (
-          <Card class="mt-5">
-            <CardContent class="p-5">
-              <h2>Storage</h2>
-              <p>
-                {storage().vendor} {storage().product} ·{' '}
-                {(storage().blocks * storage().block_size).toLocaleString()} bytes
-              </p>
-              <p class="text-sm text-muted-foreground">Read-only files</p>
-              <Accordion collapsible>
-                <AccordionItem value="storage">
-                  <AccordionTrigger>Storage details</AccordionTrigger>
-                  <AccordionContent>
-                    <p>
-                      FAT32 root only · up to 32 entries · files up to 64 KiB · no subfolders or
-                      writes.
-                    </p>
-                  </AccordionContent>
-                </AccordionItem>
-              </Accordion>
-              <Button
-                loading={http.isPending() && http.pendingCommand() === 'storage_list'}
-                disabled={
-                  !storage().fat32 ||
-                  !http.connected() ||
-                  !state().attached ||
-                  http.downloading() ||
-                  http.isPending()
-                }
-                onClick={() => {
-                  void http.command('storage_list');
-                }}
-              >
-                List files
-              </Button>
-              <Show when={state().storageError}>
-                <Callout variant="error" role="alert" class="my-3 text-sm">
-                  {state().storageError}
-                </Callout>
-              </Show>
-              <For each={state().files}>
-                {(file) => (
-                  <div class="flex flex-wrap items-center justify-between gap-3 py-2 break-all">
-                    <span>
-                      {file.name} ·{' '}
-                      {file.directory ? 'Folder' : `${file.size.toLocaleString()} bytes`}
-                    </span>
-                    <Button
-                      variant="outline"
-                      aria-label={`Download ${file.name}`}
-                      loading={http.downloading() && http.downloadingFile() === file.index}
-                      disabled={
-                        file.directory ||
-                        !state().attached ||
-                        !http.connected() ||
-                        http.downloading() ||
-                        http.isPending()
-                      }
-                      onClick={() => http.download(file)}
-                    >
-                      Download
-                    </Button>
-                  </div>
-                )}
-              </For>
-            </CardContent>
-          </Card>
-        )}
-      </Show>
-      <Trace
-        records={state().history}
-        filteredRecords={http.filteredRecords()}
-        filtersActive={http.traceFilters().active}
-        setTraceFilters={http.setTraceFilters}
-        traceLoading={http.traceLoading()}
-        traceDropped={http.traceDropped()}
-        connected={http.connected()}
-        traceError={http.traceError()}
-        retryTrace={http.retryTrace}
-        transportDropped={state().transportDropped}
-        hostDropped={state().dropped}
-        paused={http.paused()}
-        togglePaused={http.togglePaused}
-        clear={http.clear}
-        exportTrace={http.exportTrace}
-      />
+      <Suspense fallback={<p role="status">Loading device details…</p>}>
+        <div class="grid items-start gap-5 lg:grid-cols-[minmax(0,2fr)_minmax(280px,1fr)]">
+          <Topology state={state()} />
+          <Hid state={state()} />
+        </div>
+      </Suspense>
+      <Suspense fallback={<p role="status">Loading diagnostics and storage…</p>}>
+        <Show when={state().diagnostic}>
+          {(failure) => (
+            <Card class="mt-5">
+              <CardContent class="p-5">
+                <h2>Last failure</h2>
+                <p>{failure().code.replaceAll('_', ' ')}</p>
+                <Accordion collapsible>
+                  <AccordionItem value="failure">
+                    <AccordionTrigger>Technical details</AccordionTrigger>
+                    <AccordionContent>
+                      <p class="text-sm text-muted-foreground">
+                        Stage: {failure().stage} · Elapsed: {failure().elapsed_us.toLocaleString()}{' '}
+                        µs · Retries: {failure().retries.toLocaleString()}
+                      </p>
+                      <p>{decodeSetup(failure().setup)}</p>
+                      <pre>{JSON.stringify(failure(), null, 2)}</pre>
+                    </AccordionContent>
+                  </AccordionItem>
+                </Accordion>
+              </CardContent>
+            </Card>
+          )}
+        </Show>
+        <Show when={state().storage}>
+          {(storage) => (
+            <Card class="mt-5">
+              <CardContent class="p-5">
+                <h2>Storage</h2>
+                <p>
+                  {storage().vendor} {storage().product} ·{' '}
+                  {(storage().blocks * storage().block_size).toLocaleString()} bytes
+                </p>
+                <p class="text-sm text-muted-foreground">Read-only files</p>
+                <Accordion collapsible>
+                  <AccordionItem value="storage">
+                    <AccordionTrigger>Storage details</AccordionTrigger>
+                    <AccordionContent>
+                      <p>
+                        FAT32 root only · up to 32 entries · files up to 64 KiB · no subfolders or
+                        writes.
+                      </p>
+                    </AccordionContent>
+                  </AccordionItem>
+                </Accordion>
+                <Button
+                  loading={http.isPending() && http.pendingCommand() === 'storage_list'}
+                  disabled={
+                    !storage().fat32 ||
+                    !http.connected() ||
+                    !state().attached ||
+                    http.downloading() ||
+                    http.isPending()
+                  }
+                  onClick={() => {
+                    void http.command('storage_list');
+                  }}
+                >
+                  List files
+                </Button>
+                <Show when={state().storageError}>
+                  <Callout variant="error" role="alert" class="my-3 text-sm">
+                    {state().storageError}
+                  </Callout>
+                </Show>
+                <For each={state().files}>
+                  {(file) => (
+                    <div class="flex flex-wrap items-center justify-between gap-3 py-2 break-all">
+                      <span>
+                        {file.name} ·{' '}
+                        {file.directory ? 'Folder' : `${file.size.toLocaleString()} bytes`}
+                      </span>
+                      <Button
+                        variant="outline"
+                        aria-label={`Download ${file.name}`}
+                        loading={http.downloading() && http.downloadingFile() === file.index}
+                        disabled={
+                          file.directory ||
+                          !state().attached ||
+                          !http.connected() ||
+                          http.downloading() ||
+                          http.isPending()
+                        }
+                        onClick={() => http.download(file)}
+                      >
+                        Download
+                      </Button>
+                    </div>
+                  )}
+                </For>
+              </CardContent>
+            </Card>
+          )}
+        </Show>
+      </Suspense>
+      <Suspense fallback={<p role="status">Loading USB trace…</p>}>
+        <Trace
+          records={state().history}
+          filteredRecords={http.filteredRecords()}
+          filtersActive={http.traceFilters().active}
+          setTraceFilters={http.setTraceFilters}
+          traceLoading={http.traceLoading()}
+          traceDropped={http.traceDropped()}
+          connected={http.connected()}
+          traceError={http.traceError()}
+          retryTrace={http.retryTrace}
+          transportDropped={state().transportDropped}
+          hostDropped={state().dropped}
+          paused={http.paused()}
+          togglePaused={http.togglePaused}
+          clear={http.clear}
+          exportTrace={http.exportTrace}
+        />
+      </Suspense>
     </main>
   );
 }

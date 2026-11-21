@@ -715,6 +715,15 @@ block the stream. Cancellation aborts reads, pending connections and backoff;
 obsolete session/filter callbacks cannot mutate state. Queries and mutations use
 `networkMode: 'always'` so browser Internet hints do not pause the local AP.
 
+Dashboard data regions use Solid Suspense with a finite, manual-session readiness
+resource, resolved after the first validated canonical events page (including an
+empty page), or settled on cancellation/fatal disconnect. Do not read the
+never-ending SSE query's `data` to drive Suspense: it would never resolve.
+Host status, counters, topology/HID, diagnostic/storage and trace regions have
+loading fallbacks. Connection/cancel controls, command controls and error notices
+stay outside these boundaries. A loaded session retains its display during
+transient reconnects; obsolete sessions cannot settle a newer readiness resource.
+
 Storage listeners run immediately on validated canonical records. Actual stream
 interruptions, continuity resets or increased canonical loss cancel downloads;
 deliberate filter restarts preserve the canonical cursor/listeners. A reset clears

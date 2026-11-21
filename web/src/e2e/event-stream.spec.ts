@@ -33,6 +33,65 @@ test('healthy idle holds one real stream through heartbeats; EOF resumes without
   ).toEqual([1, 2]);
 });
 
+test('headers alone keep all data suspended; cancelled sessions cannot release new readiness', async ({
+  page,
+  api,
+  appURL,
+}) => {
+  const releaseOld = api.holdEvents();
+  await page.goto(appURL);
+  await expect.poll(() => api.commands).toEqual(['status']);
+  await expect.poll(() => api.cursors.length).toBe(1);
+  await page.getByRole('button', { name: 'Cancel connection', exact: true }).click();
+  await expect(page.getByRole('status').filter({ hasText: /^Loading / })).toHaveCount(0);
+
+  api.stalled = true;
+  const headers = page.waitForResponse((response) => response.url().includes('/api/events'));
+  await page.getByRole('button', { name: 'Connect', exact: true }).click();
+  await headers;
+  releaseOld();
+  await expect.poll(() => api.activeStreams).toBe(1);
+  await expect.poll(() => api.commands.length).toBe(2);
+  for (const text of [
+    'Loading device details…',
+    'Loading diagnostics and storage…',
+    'Loading USB trace…',
+  ])
+    await expect(page.getByRole('status').filter({ hasText: text })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Cancel connection', exact: true })).toBeEnabled();
+  await expect(page.getByLabel('USB host status', { exact: true })).toHaveAttribute(
+    'aria-busy',
+    'true',
+  );
+  api.stalled = false;
+  api.emit(packet(1));
+  await expect(page.getByText(label(1), { exact: true })).toBeVisible();
+  await expect(page.getByRole('status').filter({ hasText: /^Loading / })).toHaveCount(0);
+});
+
+test('loaded history stays visible during retry and after manual disconnect', async ({
+  page,
+  api,
+  appURL,
+}) => {
+  api.emit(packet(1));
+  await page.goto(appURL);
+  await expect(page.getByText(label(1), { exact: true })).toBeVisible();
+  api.eventsStatus = 503;
+  api.endStreams();
+  await expect(page.getByRole('button', { name: 'Cancel connection', exact: true })).toBeVisible();
+  await expect.poll(() => api.cursors.length).toBeGreaterThan(1);
+  await expect(page.getByText(label(1), { exact: true })).toBeVisible();
+  await expect(page.getByRole('status').filter({ hasText: /^Loading / })).toHaveCount(1);
+  await expect(page.getByText('Loading USB trace…', { exact: true })).toHaveCount(0);
+  await expect(
+    page.getByRole('region', { name: 'Trace counters' }).locator('[aria-hidden="true"]'),
+  ).toHaveCount(0);
+  await page.getByRole('button', { name: 'Cancel connection', exact: true }).click();
+  await expect(page.getByText(label(1), { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Export trace', exact: true })).toBeEnabled();
+});
+
 test('stream ingests a paused backlog once across three-record pages', async ({
   page,
   api,
