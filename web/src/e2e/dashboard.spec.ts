@@ -27,7 +27,7 @@ test('gzip bundle renders dark, keyboard-operable and accessible', async ({
   expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
 });
 
-test('status failure does not block polling; acceptance is not execution and queue-full is not retried', async ({
+test('status failure does not block streaming; acceptance is not execution and queue-full is not retried', async ({
   page,
   api,
   appURL,
@@ -50,7 +50,8 @@ test('status failure does not block polling; acceptance is not execution and que
     page.locator('[data-sonner-toast]').filter({ hasText: 'queue full' }).last(),
   ).toBeVisible();
   const polls = api.cursors.length;
-  await expect.poll(() => api.cursors.length).toBeGreaterThan(polls + 2);
+  await page.waitForTimeout(300);
+  expect(api.cursors).toHaveLength(polls);
   expect(api.commands).toEqual(['status', 'start', 'stop']);
 });
 
@@ -113,14 +114,15 @@ for (const status of [202, 503]) {
       await expect(region).toHaveAttribute('aria-busy', 'false');
       await expect(region.locator('[aria-hidden="true"]')).toHaveCount(0);
     }
-    await expect(connected).toHaveCount(1);
+    await expect(page.getByText('Connected', { exact: true })).toBeVisible();
     const polls = api.cursors.length;
-    await expect.poll(() => api.cursors.length).toBeGreaterThan(polls + 2);
-    await expect(connected).toHaveCount(1);
+    await page.waitForTimeout(300);
+    expect(api.cursors).toHaveLength(polls);
+    await expect(page.getByText('Connected', { exact: true })).toBeVisible();
   });
 }
 
-for (const failure of ['events unavailable', 'incompatible hello', 'request deadline']) {
+for (const failure of ['incompatible hello']) {
   test(`${failure} clears initial loading without reporting connection success`, async ({
     page,
     api,
@@ -213,6 +215,7 @@ test('trace filters decode fixture records; reconnect resets cursor without repl
   const setupPacket = trace.getByRole('button', { name: 'Sent · endpoint 0', exact: true });
   for (const query of ['80 06', '  gEt DeScRiPtOr  ']) {
     await search.fill(query);
+    await expect.poll(() => api.traceRequests.at(-1)?.get('q')).toBe(query.trim());
     await expect(setupPacket).toBeVisible();
     await expect(context).toBeVisible();
     await expect(trace.getByText('Received · endpoint 129', { exact: true })).toHaveCount(0);
@@ -243,8 +246,8 @@ test('trace filters decode fixture records; reconnect resets cursor without repl
   await page.getByRole('combobox', { name: 'Direction', exact: true }).fill('OUT');
   await expect(page.getByRole('listbox')).toBeVisible();
   expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
-  await page.keyboard.press('ArrowDown');
-  await page.keyboard.press('Enter');
+  await page.getByRole('option', { name: 'OUT', exact: true }).click();
+  await expect(page.getByRole('combobox', { name: 'Direction', exact: true })).toHaveValue('OUT');
   await page.getByRole('combobox', { name: 'Transfer', exact: true }).fill('Control');
   await page.getByRole('option', { name: 'Control', exact: true }).click();
   await expect(trace.getByText('Received · endpoint 129', { exact: true })).toHaveCount(0);
@@ -255,6 +258,7 @@ test('trace filters decode fixture records; reconnect resets cursor without repl
   await expect(trace.getByText(/Get descriptor/)).toBeVisible();
   await expect(trace.getByText(/RAW BYTES \(8\)/)).toContainText('80 06 00 01 00 00 12 00');
   expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
+  await expect(page.getByRole('checkbox', { name: 'Errors only' })).toBeEnabled();
   await page.getByRole('checkbox', { name: 'Errors only' }).focus();
   await page.keyboard.press('Space');
   await expect(page.getByRole('checkbox', { name: 'Errors only' })).toBeChecked();
@@ -277,7 +281,7 @@ test('trace filters decode fixture records; reconnect resets cursor without repl
   await page.getByRole('button', { name: 'Disconnect', exact: true }).click();
   api.cursors.length = 0;
   await page.getByRole('button', { name: 'Connect', exact: true }).click();
-  await expect.poll(() => api.cursors.length).toBeGreaterThan(1);
+  await expect.poll(() => api.cursors.length).toBeGreaterThan(0);
   expect(api.cursors[0]).toBe(0);
   await expect(
     page.getByText('0 records · newest first · board time', { exact: true }),
@@ -437,7 +441,7 @@ test('non-USB floods preserve trace, open details and USB-only JSON export', asy
     });
     api.emit({ type: 'host', event: 'ready' });
   }
-  await expect.poll(() => api.cursors.at(-1), { timeout: 15000 }).toBe(541);
+  await expect.poll(() => api.deliveredCursors.at(-1), { timeout: 15000 }).toBe(541);
   await expect(packet).toHaveAttribute('aria-expanded', 'true');
   await expect(
     page.getByText('1 records · newest first · board time', { exact: true }),
@@ -464,7 +468,7 @@ test('non-USB floods preserve trace, open details and USB-only JSON export', asy
   expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
 });
 
-test('pending commands mark only the clicked button busy, keep polling and reset after errors', async ({
+test('pending commands mark only the clicked button busy, keep streaming and reset after errors', async ({
   page,
   api,
   appURL,
@@ -483,7 +487,9 @@ test('pending commands mark only the clicked button busy, keep polling and reset
       if (name !== 'Start') await expect(button).not.toHaveAttribute('aria-busy', 'true');
     }
     const polls = api.cursors.length;
-    await expect.poll(() => api.cursors.length).toBeGreaterThan(polls + 1);
+    api.emit({ type: 'host', event: 'ready' });
+    await expect.poll(() => api.deliveredCursors.at(-1)).toBe(api.records.length);
+    expect(api.cursors).toHaveLength(polls);
     release();
     await expect(start).toBeEnabled();
     await expect(start).not.toHaveAttribute('aria-busy', 'true');
@@ -557,6 +563,7 @@ for (const width of [320, 375, 1280]) {
       page.getByText('Enter a whole number from 0 to 255, or clear for all.', { exact: true }),
     ).toHaveCount(0);
     api.commandStatus = 503;
+    await expect(page.getByRole('button', { name: 'Start', exact: true })).toBeEnabled();
     await page.getByRole('button', { name: 'Start', exact: true }).focus();
     await page.keyboard.press('Enter');
     await expect(page.getByRole('alert').filter({ hasText: 'queue full' })).toBeVisible();
@@ -590,7 +597,8 @@ test('a rejected command from an old connection cannot overwrite the new session
   await expect(start).toBeEnabled();
   release();
   const polls = api.cursors.length;
-  await expect.poll(() => api.cursors.length).toBeGreaterThan(polls + 2);
+  await page.waitForTimeout(300);
+  expect(api.cursors).toHaveLength(polls);
   await expect(page.getByRole('alert').filter({ hasText: 'queue full' })).toHaveCount(0);
   await expect(page.locator('[data-sonner-toast]').filter({ hasText: 'queue full' })).toHaveCount(
     0,

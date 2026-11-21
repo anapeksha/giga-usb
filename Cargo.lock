@@ -887,6 +887,7 @@ dependencies = [
  "embassy-net",
  "embassy-net-driver",
  "embassy-stm32",
+ "embassy-sync",
  "embassy-time",
  "giga-r1",
  "heapless 0.9.3",

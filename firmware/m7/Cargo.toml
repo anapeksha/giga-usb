@@ -28,6 +28,7 @@ cortex-m.workspace = true
 cortex-m-rt.workspace = true
 panic-halt.workspace = true
 embassy-executor.workspace = true
+embassy-sync.workspace = true
 defmt-rtt = { workspace = true, optional = true }
 embassy-stm32 = { workspace = true, features = ["stm32h747xi-cm7", "time-driver-tim2", "cyw43", "unstable-pac"] }
 embassy-time.workspace = true

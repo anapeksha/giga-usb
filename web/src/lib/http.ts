@@ -33,7 +33,7 @@ export function createLossRefreshGuard(now = () => performance.now()) {
     const increased = dropped > previous;
     previous = dropped;
     const time = now();
-    // Persistent assembly overflow must not create a status/poll feedback loop.
+    // Persistent assembly overflow must not create a status-refresh feedback loop.
     if (!increased || time - lastRefresh < 5000) return false;
     lastRefresh = time;
     return true;
@@ -202,26 +202,7 @@ export async function sendCommand(
   });
 }
 
-export async function getEventPage(
-  cursor: number,
-  signal: AbortSignal,
-  request: typeof fetch = fetch,
-  timeoutMs = REQUEST_TIMEOUT_MS,
-): Promise<EventPage> {
-  const page: unknown = await diagnosticRequest(signal, timeoutMs, async (requestSignal) => {
-    const response = await request(`/api/events?after=${cursor}`, {
-      signal: requestSignal,
-      cache: 'no-store',
-    });
-    if (!response.ok) throw new Error(`Events failed: HTTP ${response.status}`);
-    return response.json();
-  });
-  signal.throwIfAborted();
-  if (!validEventPage(page)) throw new Error('Invalid events response');
-  return page;
-}
-
-function validEventPage(page: unknown): page is EventPage {
+export function validEventPage(page: unknown): page is EventPage {
   if (typeof page !== 'object' || page === null) return false;
   return (
     'cursor' in page &&

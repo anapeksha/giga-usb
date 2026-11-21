@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![recursion_limit = "256"]
 #![forbid(unsafe_code)]
 
 mod http;
@@ -59,6 +60,7 @@ async fn main(spawner: Spawner) {
                 power: p.PB10,
             },
             bus,
+            spawner,
         )
         .unwrap(),
     );

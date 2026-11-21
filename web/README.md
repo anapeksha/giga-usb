@@ -62,8 +62,12 @@ unfiltered browser-history export. Resume and connect before changing filters.
   sorting and pagination are intentionally omitted to preserve transfer order and adjacent
   context. Row selection and column resizing are omitted: export already covers trace
   history, and optional-column visibility provides a simpler way to make room for details.
-  Event polling remains cursor-based: each query drains at most eight bounded pages
-  before returning to its polling interval, without caching pages of trace history.
+
+A single fetch-based SSE stream delivers events and server-filtered trace results.
+TanStack cancellation aborts the connection and pending reads. Transient failures
+reconnect with processed cursors; a continuity reset clears stale board state.
+Header/read deadlines and heartbeats detect stalled connections. Histories remain
+bounded outside the query cache; there is no event or trace polling timer.
 
 ## Develop locally
 

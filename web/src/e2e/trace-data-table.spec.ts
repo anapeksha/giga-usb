@@ -199,7 +199,7 @@ test('500-record history keeps its anchor with hidden columns and expansion thro
     };
   });
   for (let i = 0; i < 24; i++) emit();
-  await expect.poll(() => api.cursors.at(-1), { timeout: 10000 }).toBe(524);
+  await expect.poll(() => api.deliveredCursors.at(-1), { timeout: 10000 }).toBe(524);
   const record = viewport.locator(`[data-trace-record="${anchor.key}"]`);
   await expect(record).toBeAttached();
   await expect

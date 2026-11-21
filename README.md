@@ -48,7 +48,7 @@ not mass erase. Recovery and CubeProgrammer instructions are in the
 2. Connect a supported peripheral to **USB-A**, then click **Start**.
    **Never connect USB-A to another computer.** Respect the board's power limits.
 3. Inspect topology, input and traces. **Stop** disables the host;
-   browser **Disconnect** only stops polling. Exports may contain sensitive input.
+   browser **Disconnect** only closes the event stream. Exports may contain sensitive input.
 
 Networking is AP-only: no router setup, password entry or credential saving.
 Do not change the development Mac's Wi-Fi; use a separate client for testing.

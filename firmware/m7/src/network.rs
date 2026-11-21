@@ -2,6 +2,7 @@
 
 use core::{fmt::Write, net::Ipv4Addr};
 use cyw43::State;
+use embassy_executor::Spawner;
 use embassy_futures::join::join;
 use embassy_net::{Config, Ipv4Cidr, Stack, StackResources, StaticConfigV4};
 use embassy_stm32::{
@@ -25,7 +26,7 @@ use static_cell::StaticCell;
 
 bind_interrupts!(struct Irqs { SDMMC1 => sdmmc::InterruptHandler<peripherals::SDMMC1>; });
 static RADIO: StaticCell<State> = StaticCell::new();
-static RESOURCES: StaticCell<StackResources<6>> = StaticCell::new();
+static RESOURCES: StaticCell<StackResources<8>> = StaticCell::new();
 
 pub struct Pins {
     pub sdmmc: Peri<'static, peripherals::SDMMC1>,
@@ -38,9 +39,9 @@ pub struct Pins {
     pub power: Peri<'static, peripherals::PB10>,
 }
 
-/// Run the open GigaUSB AP, DHCP and two HTTP workers indefinitely.
+/// Run the open GigaUSB AP, DHCP and three HTTP workers indefinitely.
 #[embassy_executor::task]
-pub async fn run(pins: Pins, bus: &'static Bus) {
+pub async fn run(pins: Pins, bus: &'static Bus, spawner: Spawner) {
     let mut sdmmc = Sdmmc::new_4bit(
         pins.sdmmc,
         Irqs,
@@ -104,14 +105,10 @@ pub async fn run(pins: Pins, bus: &'static Bus) {
             0x4749_4741_5553_4201,
         );
         let _ = bus.command(HostCommand::Status);
-        join(
-            net.run(),
-            join(
-                dhcp(stack),
-                join(http::serve(stack, bus), http::serve(stack, bus)),
-            ),
-        )
-        .await;
+        for _ in 0..3 {
+            spawner.spawn(http::serve(stack, bus).unwrap());
+        }
+        join(net.run(), dhcp(stack)).await;
     };
     join(runner.run(), services).await;
 }

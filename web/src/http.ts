@@ -1,38 +1,38 @@
 import { createQuery, createMutation, useQueryClient } from '@tanstack/solid-query';
-import { createSignal, onCleanup, onMount } from 'solid-js';
+import { batch, createSignal, onCleanup, onMount } from 'solid-js';
 import { toast } from 'solid-sonner';
 import { appendFileChunk } from './lib/storage';
+import { createState, hostEvent, type ProtocolRecord, type HostPayloads } from './lib/protocol';
 import {
-  createState,
-  hostEvent,
-  type ProtocolRecord,
-  type HostPayloads,
-  PROTOCOL_VERSION,
-} from './lib/protocol';
-import {
-  getTracePage,
   normalizeTraceFilters,
   type TraceFilterInput,
   applyEventPage,
   createLossRefreshGuard,
-  getEventPage,
   sendCommand,
   type Command,
 } from './lib/http';
+import { runEventStream } from './lib/event-stream';
 export type { Command } from './lib/http';
 
 const message = (error: unknown) => (error instanceof Error ? error.message : String(error));
-const MAX_EVENT_PAGES = 8;
+
 let nextSession = 0;
 
 export function createHttpController() {
   const client = useQueryClient();
   let state = { ...createState(), transportDropped: 0 };
-  let cursor = 0;
+  const cursors: { events: number; trace: number; resume?: string } = { events: 0, trace: 0 };
+  const interruptions = new Set<() => void>();
+  let deliveryGeneration = 0;
+  const failDownloads = () => {
+    deliveryGeneration++;
+    for (const fail of interruptions) fail();
+  };
   let lastGenericError: string | undefined;
   const listeners = new Set<(record: ProtocolRecord) => void>();
 
   let session: AbortController | null = null;
+  let streamClient = '';
   let refreshGuard = createLossRefreshGuard();
   const [sessionId, setSessionId] = createSignal(0);
   const [active, setActive] = createSignal(false);
@@ -74,65 +74,6 @@ export function createHttpController() {
     if (!command.isPending) command.mutate({ command: 'status', current, silent: true });
   };
 
-  const events = createQuery(() => ({
-    queryKey: ['events', sessionId()],
-    enabled: active(),
-    networkMode: 'always',
-    retry: false,
-    gcTime: 0,
-    staleTime: 0,
-    refetchOnMount: 'always',
-    refetchOnReconnect: false,
-    refetchInterval: 150,
-    queryFn: async ({ signal }) => {
-      const current = session;
-      if (!current) throw new Error('Disconnected');
-      try {
-        // Bound catch-up work even when the board continuously returns full pages.
-        for (let pageIndex = 0; pageIndex < MAX_EVENT_PAGES; pageIndex++) {
-          const page = await getEventPage(cursor, signal);
-          if (session !== current || current.signal.aborted) throw new Error('Disconnected');
-          if (
-            page.records.some(
-              (record) =>
-                record.event.type === 'hello' && record.event.protocol_version !== PROTOCOL_VERSION,
-            )
-          )
-            throw new Error(
-              'Board software is incompatible with this app. Update the board and app together.',
-            );
-          cursor = page.cursor;
-          applyEventPage(state, page);
-          for (const record of page.records) {
-            if (record.event.type === 'error') {
-              const text = record.event.message;
-              notify(text, true, text !== lastGenericError);
-              lastGenericError = text;
-            }
-            for (const listener of listeners) listener(record);
-          }
-          if (!connected()) {
-            setConnected(true);
-            if (!page.records.some((record) => record.event.type === 'error'))
-              toast.success('Connected.');
-            if (!notice().error) notify('Connected.', false, false);
-          }
-          if (refreshGuard(page.dropped)) refreshStatus(current);
-          if (page.records.length < 3 || signal.aborted) break;
-        }
-        if (!paused()) publish();
-        return { cursor };
-      } catch (error) {
-        if (session === current && !signal.aborted) {
-          if (!paused()) publish();
-          notify(`Connection failed: ${message(error)} Click Connect to retry.`, true);
-          disconnect();
-        }
-        throw error;
-      }
-    },
-  }));
-
   const [traceFilters, setTraceFilters] = createSignal(
     normalizeTraceFilters({ endpoint: '', direction: '', kind: '', errors: false, q: '' }),
   );
@@ -142,67 +83,134 @@ export function createHttpController() {
   onCleanup(() => clearTimeout(traceSearchTimer));
   const [filteredRecords, setFilteredRecords] = createSignal<ProtocolRecord[]>([]);
   const [traceDropped, setTraceDropped] = createSignal(0);
-  let traceCursor = 0;
   let traceHistory: ProtocolRecord[] = [];
+  const [traceReady, setTraceReady] = createSignal(false);
+  const [streamError, setStreamError] = createSignal('');
   const resetTrace = () => {
-    void client.cancelQueries({ queryKey: ['trace', sessionId(), traceEpoch()], exact: true });
-    traceCursor = 0;
+    void client.cancelQueries({ queryKey: ['events', sessionId()] });
+    setConnected(false);
+    cursors.trace = 0;
     setTraceDropped(0);
     traceHistory = [];
     setFilteredRecords([]);
+    setTraceReady(false);
     setTraceEpoch((value) => value + 1);
   };
-  const filteredTrace = createQuery<{ cursor: number }>(() => ({
-    queryKey: ['trace', sessionId(), traceEpoch()],
-    enabled: active() && traceFilters().active && !traceFilters().error && !traceDebouncing(),
+  createQuery(() => ({
+    queryKey: ['events', sessionId(), traceEpoch()],
+    enabled: active(),
     networkMode: 'always',
     retry: false,
     gcTime: 0,
-    staleTime: 0,
     refetchOnReconnect: false,
-    refetchInterval: (query) => (query.state.status === 'error' ? false : 150),
-    queryFn: async ({ signal }) => {
-      const epoch = traceEpoch();
+    refetchOnWindowFocus: false,
+    queryFn: async ({ signal, queryKey }) => {
       const current = session;
       const filters = traceFilters();
+      if (!current) throw new Error('Disconnected');
+      const ensureCurrent = () => {
+        signal.throwIfAborted();
+        if (session !== current || current.signal.aborted || queryKey[2] !== traceEpoch())
+          throw new DOMException('Cancelled', 'AbortError');
+      };
+      setStreamError('');
       try {
-        for (let index = 0; index < MAX_EVENT_PAGES; index++) {
-          const page = await getTracePage(traceCursor, filters, signal);
-          if (signal.aborted || epoch !== traceEpoch() || current !== session)
-            throw new Error('Cancelled');
-          const seen = new Set(traceHistory.map((record) => record.sequence));
-          for (const item of page.records) {
-            if (!seen.has(item.sequence)) {
-              traceHistory.push({ ...item.record, sequence: item.sequence });
-              seen.add(item.sequence);
+        return await runEventStream({
+          signal,
+          sessionSignal: current.signal,
+          cursors,
+          filters,
+          client: streamClient,
+          onReset: () => {
+            ensureCurrent();
+            failDownloads();
+            state = { ...createState(), transportDropped: 0 };
+            traceHistory = [];
+            refreshGuard = createLossRefreshGuard();
+            lastGenericError = undefined;
+            setTraceDropped(0);
+            setTraceReady(false);
+            setStreamError('');
+            setConnected(false);
+            notify('Stream continuity changed. Refreshing device state…', false, false);
+            if (!paused()) {
+              publish();
+              setFilteredRecords([]);
             }
-          }
-          traceHistory = traceHistory.slice(-500);
-          traceCursor = page.cursor;
-          setTraceDropped(page.dropped);
-          if (page.records.length < 3) break;
+          },
+          onEvents: (page) => {
+            ensureCurrent();
+            if (page.dropped > state.transportDropped) failDownloads();
+            applyEventPage(state, page);
+            for (const record of page.records) {
+              if (record.event.type === 'error') {
+                const text = record.event.message;
+                notify(text, true, text !== lastGenericError);
+                lastGenericError = text;
+              }
+              for (const listener of listeners) listener(record);
+            }
+            if (!connected()) {
+              setConnected(true);
+              if (!page.records.some((record) => record.event.type === 'error'))
+                notify('Connected.', false, false);
+            }
+            setStreamError('');
+            if (refreshGuard(page.dropped)) refreshStatus(current);
+            if (!paused()) publish();
+          },
+          onTrace: (page) => {
+            ensureCurrent();
+            const seen = new Set(traceHistory.map((record) => record.sequence));
+            for (const item of page.records) {
+              if (!seen.has(item.sequence)) {
+                traceHistory.push({ ...item.record, sequence: item.sequence });
+                seen.add(item.sequence);
+              }
+            }
+            traceHistory = traceHistory.slice(-500);
+            setTraceDropped(page.dropped);
+            setTraceReady(true);
+            if (!paused()) setFilteredRecords([...traceHistory]);
+          },
+          onInterruption: (error) => {
+            ensureCurrent();
+            failDownloads();
+            setConnected(false);
+            setTraceReady(false);
+            setStreamError(message(error));
+            notify('Connection interrupted. Reconnecting…', true, false);
+          },
+        });
+      } catch (error) {
+        if (session === current && !signal.aborted && !current.signal.aborted) {
+          notify('Connection failed: ' + message(error) + ' Click Connect to retry.', true);
+          disconnect();
         }
-      } finally {
-        if (epoch === traceEpoch() && current === session && !signal.aborted && !paused())
-          setFilteredRecords([...traceHistory]);
+        throw error;
       }
-      return { cursor: traceCursor };
     },
   }));
 
   function disconnect() {
-    void client.cancelQueries({ queryKey: ['trace', sessionId(), traceEpoch()], exact: true });
+    clearTimeout(traceSearchTimer);
+    setTraceDebouncing(false);
     session?.abort();
     session = null;
     setActive(false);
     setConnected(false);
-    void client.cancelQueries({ queryKey: ['events', sessionId()], exact: true });
+    void client.cancelQueries({ queryKey: ['events', sessionId()] });
   }
   function connect() {
     if (session) return;
     const current = new AbortController();
     session = current;
-    cursor = 0;
+    // A continuity token, not authentication; getRandomValues also works over HTTP.
+    streamClient = Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) =>
+      byte.toString(16).padStart(2, '0'),
+    ).join('');
+    cursors.events = 0;
+    delete cursors.resume;
     lastGenericError = undefined;
     resetTrace();
     refreshGuard = createLossRefreshGuard();
@@ -212,7 +220,7 @@ export function createHttpController() {
     notify('Connecting to GIGA…', false, false);
     setSessionId(++nextSession);
     setActive(true);
-    // Status acceptance is independent of event polling, including on initial failure.
+    // Status acceptance is independent of the event stream, including on initial failure.
     refreshStatus(current);
   }
   const download = createMutation(() => ({
@@ -229,6 +237,7 @@ export function createHttpController() {
     }) => {
       if (current !== session || current.signal.aborted || !connected() || !state.attached)
         throw new Error('Device disconnected');
+      const generation = deliveryGeneration;
       const chunks: number[] = [];
       do {
         const offset = chunks.length;
@@ -247,11 +256,13 @@ export function createHttpController() {
             settled = true;
             clearTimeout(timer);
             listeners.delete(receive);
+            interruptions.delete(interrupted);
             current.signal.removeEventListener('abort', abort);
             if (error) reject(error);
             else resolve(data!);
           };
           const abort = () => finish(new Error('Disconnected'));
+          const interrupted = () => finish(new Error('Connection interrupted; download cancelled'));
           const receive = (record: ProtocolRecord) => {
             const p = record.event.type === 'host' ? hostEvent(record.event.event) : null;
             if (record.event.type === 'error') finish(new Error(record.event.message));
@@ -269,6 +280,7 @@ export function createHttpController() {
           };
           const timer = setTimeout(() => finish(new Error('File response timed out')), 10000);
           listeners.add(receive);
+          interruptions.add(interrupted);
           current.signal.addEventListener('abort', abort, { once: true });
           void sendCommand({ storage_read: { file: file.index, offset } }, current.signal)
             .then(() => {
@@ -277,6 +289,8 @@ export function createHttpController() {
             })
             .catch((error) => finish(new Error(message(error))));
         });
+        if (generation !== deliveryGeneration || current !== session || current.signal.aborted)
+          throw new Error('Connection continuity lost; download cancelled');
         if (appendFileChunk(file, chunks, chunk)) break;
       } while (chunks.length < 65536);
       const url = URL.createObjectURL(new Blob([new Uint8Array(chunks)]));
@@ -304,23 +318,30 @@ export function createHttpController() {
       if (paused() || !connected()) return;
       const normalized = normalizeTraceFilters(input);
       if (JSON.stringify(normalized) === JSON.stringify(traceFilters())) return;
-      const searchChanged = normalized.q !== traceFilters().q;
+
       clearTimeout(traceSearchTimer);
-      setTraceDebouncing(searchChanged);
-      setTraceFilters(normalized);
-      resetTrace();
-      if (searchChanged) traceSearchTimer = setTimeout(() => setTraceDebouncing(false), 200);
+      setTraceDebouncing(true);
+      const apply = () =>
+        batch(() => {
+          setTraceFilters(normalized);
+          resetTrace();
+          setTraceDebouncing(false);
+        });
+      traceSearchTimer = setTimeout(apply, 200);
     },
     traceLoading: () =>
       traceFilters().active &&
       !traceFilters().error &&
       active() &&
-      (traceDebouncing() || filteredTrace.isLoading),
-    traceError: () =>
-      traceFilters().error ||
-      (traceFilters().active && filteredTrace.error ? message(filteredTrace.error) : ''),
+      (traceDebouncing() || !traceReady()),
+    traceError: () => traceFilters().error || (traceFilters().active ? streamError() : ''),
     retryTrace: () => {
-      if (active() && !traceFilters().error) void filteredTrace.refetch();
+      if (active() && !traceFilters().error) {
+        void client.cancelQueries({ queryKey: ['events', sessionId()] });
+        setConnected(false);
+        setTraceReady(false);
+        setTraceEpoch((value) => value + 1);
+      }
     },
     downloading: () => download.isPending,
     downloadingFile: () => (download.isPending ? download.variables?.file.index : undefined),
@@ -330,7 +351,7 @@ export function createHttpController() {
     },
     connected,
     busy: () => active() && !connected(),
-    isLoading: () => active() && !connected() && events.isLoading,
+    isLoading: () => active() && !connected(),
     isPending: () => command.isPending && command.variables?.current === session,
     pendingCommand: () =>
       command.isPending && command.variables?.current === session

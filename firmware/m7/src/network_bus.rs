@@ -11,7 +11,46 @@ use shared::{
 pub use shared::protocol::RECORD_BYTES;
 const HISTORY: usize = 64;
 /// Single-executor command queue and complete-record history; not cross-core synchronization.
-pub struct Bus(RefCell<State>);
+pub struct Bus(RefCell<State>, [SubscriberSlot; 2]);
+
+struct SubscriberSlot {
+    active: core::cell::Cell<bool>,
+    token: RefCell<Option<String<32>>>,
+    proof: RefCell<Option<String<32>>>,
+    changed: shared::ipc_delivery::Queue<(), 1>,
+}
+
+impl SubscriberSlot {
+    const fn new() -> Self {
+        Self {
+            active: core::cell::Cell::new(false),
+            token: RefCell::new(None),
+            proof: RefCell::new(None),
+            changed: shared::ipc_delivery::Queue::new(),
+        }
+    }
+}
+
+/// A coalescing, per-client Embassy channel notification. Dropping releases admission.
+/// Like the bus, this is only for the cooperative M7 executor.
+pub struct Subscriber<'a> {
+    slot: &'a SubscriberSlot,
+    pub resumed: bool,
+    pub proof: Option<String<32>>,
+}
+
+impl Subscriber<'_> {
+    pub async fn changed(&self) {
+        self.slot.changed.receive().await;
+    }
+}
+
+impl Drop for Subscriber<'_> {
+    fn drop(&mut self) {
+        self.slot.active.set(false);
+        self.slot.changed.clear();
+    }
+}
 struct State {
     commands: Deque<HostCommand, 4>,
     records: Deque<(u32, Vec<u8, RECORD_BYTES>), HISTORY>,
@@ -29,17 +68,79 @@ impl Default for Bus {
 }
 impl Bus {
     pub const fn new() -> Self {
-        Self(RefCell::new(State {
-            commands: Deque::new(),
-            records: Deque::new(),
-            assembly: Vec::new(),
-            assembling: false,
-            cursor: 0,
-            dropped: 0,
-            network: None,
-            led: Input::new(),
-        }))
+        Self(
+            RefCell::new(State {
+                commands: Deque::new(),
+                records: Deque::new(),
+                assembly: Vec::new(),
+                assembling: false,
+                cursor: 0,
+                dropped: 0,
+                network: None,
+                led: Input::new(),
+            }),
+            [SubscriberSlot::new(), SubscriberSlot::new()],
+        )
     }
+
+    pub fn subscribe(&self) -> Option<Subscriber<'_>> {
+        self.subscribe_client(None, None, None)
+    }
+
+    /// Tokens only remember cursor continuity; they are not authentication.
+    /// Resume requires acknowledging a reset proof, not merely admission or a write.
+    pub fn subscribe_client(
+        &self,
+        token: Option<&str>,
+        attempt: Option<&str>,
+        resume: Option<&str>,
+    ) -> Option<Subscriber<'_>> {
+        // Validate every bounded input before changing remembered state.
+        let token = token.map(String::<32>::try_from).transpose().ok()?;
+        let attempt = attempt.map(String::<32>::try_from).transpose().ok()?;
+        let resume = resume.map(String::<32>::try_from).transpose().ok()?;
+        let remembered = token.as_deref().and_then(|token| {
+            self.1
+                .iter()
+                .find(|slot| slot.token.borrow().as_deref() == Some(token))
+        });
+
+        let slot = if let Some(slot) = remembered {
+            if slot.active.get() {
+                return None;
+            }
+            slot
+        } else {
+            self.1.iter().find(|slot| !slot.active.get())?
+        };
+        let resumed = remembered.is_some()
+            && slot
+                .proof
+                .borrow()
+                .as_ref()
+                .is_some_and(|proof| !proof.is_empty() && Some(proof) == resume.as_ref());
+        if !resumed {
+            *slot.token.borrow_mut() = token;
+            *slot.proof.borrow_mut() = attempt;
+        }
+        let proof = slot.proof.borrow().clone();
+        slot.changed.clear();
+        slot.active.set(true);
+        Some(Subscriber {
+            slot,
+            resumed,
+            proof,
+        })
+    }
+
+    fn notify(&self) {
+        for slot in &self.1 {
+            if slot.active.get() {
+                let _ = slot.changed.push_back(());
+            }
+        }
+    }
+
     pub fn set_network(&self, info: NetworkInfo) {
         let mut state = self.0.borrow_mut();
         state.led.network = if info.error.is_some() || info.mode.as_str() == "error" {
@@ -91,7 +192,12 @@ impl Bus {
         if state.records.is_full() {
             state.records.pop_front();
         }
-        state.records.push_back((cursor, bytes)).is_ok()
+        let published = state.records.push_back((cursor, bytes)).is_ok();
+        drop(state);
+        if published {
+            self.notify();
+        }
+        published
     }
 
     pub fn next_command(&self) -> Option<HostCommand> {
@@ -114,7 +220,13 @@ impl Bus {
         }
         if s.assembly.extend_from_slice(bytes).is_err() {
             s.assembling = false;
+            let previous = s.dropped;
             s.dropped = s.dropped.saturating_add(1);
+            let changed = previous != s.dropped;
+            drop(s);
+            if changed {
+                self.notify();
+            }
             return;
         }
         if flags & 2 != 0 {
@@ -126,6 +238,8 @@ impl Bus {
                 s.records.pop_front();
             }
             let _ = s.records.push_back((cursor, record));
+            drop(s);
+            self.notify();
         }
     }
     /// Filter retained history without changing event delivery or counting exclusions as loss.
@@ -257,6 +371,318 @@ impl Bus {
 mod tests {
     use super::*;
     use shared::protocol::Event;
+    extern crate std;
+    use core::{
+        future::Future,
+        pin::pin,
+        task::{Context, Poll, Waker},
+    };
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::Wake,
+    };
+
+    #[derive(Default)]
+    struct Wakes(AtomicUsize);
+    impl Wake for Wakes {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn every_pending_subscriber_wakes_and_a_released_slot_can_wait_again() {
+        let bus = Bus::new();
+        let first = bus.subscribe().unwrap();
+        let second = bus.subscribe().unwrap();
+        let wakes = [Arc::new(Wakes::default()), Arc::new(Wakes::default())];
+        let wakers = [Waker::from(wakes[0].clone()), Waker::from(wakes[1].clone())];
+        {
+            let mut waits = [pin!(first.changed()), pin!(second.changed())];
+            for (wait, waker) in waits.iter_mut().zip(&wakers) {
+                assert!(
+                    wait.as_mut()
+                        .poll(&mut Context::from_waker(waker))
+                        .is_pending()
+                );
+            }
+            assert!(bus.publish_ipc_error(1, 0));
+            for ((wait, waker), count) in waits.iter_mut().zip(&wakers).zip(&wakes) {
+                assert!(count.0.load(Ordering::Relaxed) > 0);
+                assert_eq!(
+                    wait.as_mut().poll(&mut Context::from_waker(waker)),
+                    Poll::Ready(())
+                );
+            }
+        }
+        // Cancel an outstanding receive exactly as disconnect cancels EventSource.
+        {
+            let mut wait = pin!(first.changed());
+            assert!(
+                wait.as_mut()
+                    .poll(&mut Context::from_waker(&wakers[0]))
+                    .is_pending()
+            );
+        }
+        drop(first);
+        assert!(bus.publish_ipc_error(2, 0));
+        let replacement = bus.subscribe().unwrap();
+        let mut wait = pin!(replacement.changed());
+        let mut cx = Context::from_waker(&wakers[0]);
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+        assert!(bus.publish_ipc_error(3, 0));
+        assert_eq!(wait.as_mut().poll(&mut cx), Poll::Ready(()));
+    }
+
+    #[test]
+    fn partial_chunks_do_not_notify_but_completion_and_loss_metadata_do() {
+        let bus = Bus::new();
+        let subscriber = bus.subscribe().unwrap();
+        bus.receive(&Message::with_payload(Event::Ui, b"\x01{").unwrap());
+        assert!(subscriber.slot.changed.is_empty());
+        bus.receive(&Message::with_payload(Event::Ui, b"\x02}").unwrap());
+        assert_eq!(subscriber.slot.changed.pop_front(), Some(()));
+        assert_eq!(crate::event_stream::position(&bus.events(0)).cursor, 1);
+
+        let mut stream = crate::event_stream::StreamPages::new(crate::event_stream::StreamQuery {
+            after: 1,
+            trace_after: 1,
+            trace: true,
+            ..Default::default()
+        });
+        let initial = stream.next(&bus);
+        assert!(initial.events.is_some());
+        assert!(initial.trace.is_some());
+        assert!(!stream.next(&bus).pending);
+        let chunk = [b'x'; 200];
+        let mut data = Vec::<u8, 256>::new();
+        data.push(1).unwrap();
+        data.extend_from_slice(&chunk).unwrap();
+        bus.receive(&Message::with_payload(Event::Ui, &data).unwrap());
+        data[0] = 0;
+        for _ in 0..4 {
+            bus.receive(&Message::with_payload(Event::Ui, &data).unwrap());
+        }
+        assert!(subscriber.slot.changed.is_empty());
+        bus.receive(&Message::with_payload(Event::Ui, &data).unwrap());
+        assert_eq!(subscriber.slot.changed.pop_front(), Some(()));
+        let page = crate::event_stream::position(&bus.events(1));
+        assert_eq!(page.cursor, 1);
+        assert_eq!(page.dropped, 1);
+        let metadata = stream.next(&bus);
+        assert!(!metadata.pending);
+        assert_eq!(
+            crate::event_stream::position(&metadata.events.unwrap()).dropped,
+            1
+        );
+        assert_eq!(
+            crate::event_stream::position(&metadata.trace.unwrap()).dropped,
+            1
+        );
+        let idle = stream.next(&bus);
+        assert!(idle.events.is_none());
+        assert!(idle.trace.is_none());
+        bus.receive(&Message::with_payload(Event::Ui, &data).unwrap());
+        assert!(subscriber.slot.changed.is_empty());
+    }
+
+    #[test]
+    fn dropped_reset_is_not_acknowledged_and_each_stale_retry_rotates_the_proof() {
+        let bus = Bus::new();
+        let first = bus
+            .subscribe_client(Some("client"), Some("attempt-1"), Some("old-boot"))
+            .unwrap();
+        assert!(!first.resumed);
+        assert_eq!(first.proof.as_deref(), Some("attempt-1"));
+        let slot = first.slot;
+        drop(first); // Reset never reached the application.
+        for attempt in ["attempt-2", "attempt-3"] {
+            let retry = bus
+                .subscribe_client(Some("client"), Some(attempt), Some("old-boot"))
+                .unwrap();
+            assert!(!retry.resumed);
+            assert!(core::ptr::eq(retry.slot, slot));
+            assert_eq!(retry.proof.as_deref(), Some(attempt));
+        }
+        let acknowledged = bus
+            .subscribe_client(Some("client"), Some("attempt-4"), Some("attempt-3"))
+            .unwrap();
+        assert!(acknowledged.resumed);
+        assert_eq!(acknowledged.proof.as_deref(), Some("attempt-3"));
+        drop(acknowledged);
+        // Successful resumes retain the acknowledged proof rather than rotating it.
+        assert!(
+            bus.subscribe_client(Some("client"), Some("attempt-5"), Some("attempt-3"))
+                .unwrap()
+                .resumed
+        );
+        let rebooted = Bus::new();
+        let retry = rebooted
+            .subscribe_client(Some("client"), Some("new-boot-attempt"), Some("attempt-3"))
+            .unwrap();
+        assert!(!retry.resumed);
+        assert_eq!(retry.proof.as_deref(), Some("new-boot-attempt"));
+    }
+
+    #[test]
+    fn missing_or_empty_proof_never_resumes_and_invalid_inputs_leave_proof_intact() {
+        let bus = Bus::new();
+        for attempt in [None, Some("")] {
+            drop(bus.subscribe_client(Some("client"), attempt, None).unwrap());
+            let retry = bus
+                .subscribe_client(Some("client"), attempt, attempt)
+                .unwrap();
+            assert!(!retry.resumed);
+        }
+        drop(
+            bus.subscribe_client(Some("client"), Some("acknowledged"), None)
+                .unwrap(),
+        );
+        let too_long = "0123456789abcdef0123456789abcdef0";
+        for (client, attempt, resume) in [
+            (Some(too_long), Some("replacement"), Some("acknowledged")),
+            (Some("client"), Some(too_long), Some("acknowledged")),
+            (Some("client"), Some("replacement"), Some(too_long)),
+        ] {
+            assert!(bus.subscribe_client(client, attempt, resume).is_none());
+        }
+        assert!(
+            bus.subscribe_client(Some("client"), Some("fresh"), Some("acknowledged"))
+                .unwrap()
+                .resumed
+        );
+    }
+
+    #[test]
+    fn remembered_client_resumes_only_after_the_active_stream_exits() {
+        let bus = Bus::new();
+        let first = bus
+            .subscribe_client(Some("client-a"), Some("attempt-a"), Some("attempt-a"))
+            .unwrap();
+        assert!(!first.resumed);
+        assert!(
+            bus.subscribe_client(Some("client-a"), Some("attempt-a"), Some("attempt-a"))
+                .is_none()
+        );
+        // A duplicate must not occupy the other free slot.
+        let other = bus
+            .subscribe_client(Some("client-b"), Some("attempt-b"), Some("attempt-b"))
+            .unwrap();
+        assert!(!other.resumed);
+        assert!(bus.publish_ipc_error(1, 0));
+        drop(first);
+        let resumed = bus
+            .subscribe_client(Some("client-a"), Some("attempt-a"), Some("attempt-a"))
+            .unwrap();
+        assert!(resumed.resumed);
+        assert!(resumed.slot.changed.is_empty());
+        assert!(core::ptr::eq(resumed.slot, &bus.1[0]));
+        assert!(
+            bus.subscribe_client(Some("client-c"), Some("attempt-c"), Some("attempt-c"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn eviction_replaces_only_inactive_tokens_and_anonymous_clients_never_resume() {
+        let bus = Bus::new();
+        let first = bus
+            .subscribe_client(Some("client-a"), Some("attempt-a"), Some("attempt-a"))
+            .unwrap();
+        let other = bus
+            .subscribe_client(Some("client-b"), Some("attempt-b"), Some("attempt-b"))
+            .unwrap();
+        drop(first);
+        let replacement = bus
+            .subscribe_client(Some("client-c"), Some("attempt-c"), Some("attempt-c"))
+            .unwrap();
+        assert!(!replacement.resumed);
+        assert!(
+            bus.subscribe_client(Some("client-a"), Some("attempt-a"), Some("attempt-a"))
+                .is_none()
+        );
+        assert_eq!(other.slot.token.borrow().as_deref(), Some("client-b"));
+        drop(replacement);
+        let forgotten = bus
+            .subscribe_client(Some("client-a"), Some("attempt-a"), Some("attempt-a"))
+            .unwrap();
+        assert!(!forgotten.resumed);
+        drop(forgotten);
+        let anonymous = bus.subscribe().unwrap();
+        assert!(!anonymous.resumed);
+        assert!(anonymous.slot.token.borrow().is_none());
+        drop(anonymous);
+        let anonymous = bus.subscribe().unwrap();
+        assert!(!anonymous.resumed);
+    }
+
+    #[test]
+    fn cancelling_a_pending_client_wait_releases_admission_but_keeps_the_token() {
+        let bus = Bus::new();
+        let client = bus
+            .subscribe_client(Some("client-a"), Some("attempt-a"), Some("attempt-a"))
+            .unwrap();
+        {
+            let mut pending = pin!(client.changed());
+            assert!(
+                pending
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+        }
+        drop(client);
+        let resumed = bus
+            .subscribe_client(Some("client-a"), Some("attempt-a"), Some("attempt-a"))
+            .unwrap();
+        assert!(resumed.resumed);
+        let mut pending = pin!(resumed.changed());
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(pending.as_mut().poll(&mut cx).is_pending());
+        assert!(bus.publish_ipc_error(1, 0));
+        assert_eq!(pending.as_mut().poll(&mut cx), Poll::Ready(()));
+    }
+
+    #[test]
+    fn subscribers_are_bounded_broadcast_coalesced_and_released() {
+        let bus = Bus::new();
+        let first = bus.subscribe().unwrap();
+        let second = bus.subscribe().unwrap();
+        assert!(bus.subscribe().is_none());
+        assert!(bus.command(HostCommand::Status));
+        assert!(first.slot.changed.is_empty());
+        assert!(bus.publish_ipc_error(1, 0));
+        assert!(bus.publish_ipc_error(2, 0));
+        assert_eq!(first.slot.changed.len(), 1);
+        assert_eq!(second.slot.changed.len(), 1);
+        drop(first);
+        let replacement = bus.subscribe().unwrap();
+        assert!(replacement.slot.changed.is_empty());
+        assert!(bus.subscribe().is_none());
+        drop(second);
+        drop(replacement);
+        assert!(bus.subscribe().is_some());
+    }
+
+    #[test]
+    fn slow_subscriber_never_blocks_history_and_resynchronizes() {
+        let bus = Bus::new();
+        let subscriber = bus.subscribe().unwrap();
+        for i in 0..100 {
+            assert!(bus.publish_ipc_error(i, 0));
+        }
+        assert_eq!(subscriber.slot.changed.len(), 1);
+        let page = crate::event_stream::position(&bus.events(0));
+        assert_eq!(page.cursor, 39);
+        assert_eq!(page.dropped, 36);
+        assert!(bus.events(0).len() <= 4096);
+    }
     #[test]
     fn ap_network_diagnostics_and_led_survive_status_requests() {
         let bus = Bus::new();

@@ -293,10 +293,11 @@ saving. The dashboard has no SSID/password form or Wi-Fi API.
 The open AP and unauthenticated, unencrypted HTTP are development security
 tradeoffs. Use a trusted environment; do not claim isolation or production security.
 
-HTTP commands are queued: 202 is acceptance, not completion. Event polling is
-cursor-based and bounded. All browser requests need deadlines, including body
-reads, and cancellation must work while connecting. Initial status failure must
-not prevent event polling. Do not use secure-context-only APIs for the HTTP UI.
+HTTP commands are queued: 202 is acceptance, not completion. Events use bounded,
+cursor-based SSE rather than periodic browser requests. All browser requests need
+deadlines, including stream reads, and cancellation must work while connecting.
+Initial status failure must not prevent the event stream. Do not use
+secure-context-only APIs for the HTTP UI.
 
 ## Web implementation
 
@@ -478,8 +479,11 @@ workflow remains hardware-unvalidated.
 
 ## Network diagnostics and API
 
-M7 runs picoserve with two bounded HTTP workers on port 80. M4's USB-C CDC
-link is independent; a missing serial client must not stop HTTP.
+M7 runs picoserve with three bounded HTTP workers on port 80, eight network socket
+slots, and admission for at most two SSE streams. This leaves one HTTP worker for
+commands and ordinary requests; excess stream requests receive 503. Each worker
+owns an 8-KiB page buffer pair plus bounded TCP/HTTP buffers. M4's USB-C CDC link
+is independent; a missing serial client must not stop HTTP.
 The open `GigaUSB` AP is `192.168.4.1/24`; leasehund assigns
 `192.168.4.100`–`192.168.4.131` with one-hour leases. It is neither an Internet
 router nor a captive portal. Open `http://192.168.4.1/` from a separate client.
@@ -555,18 +559,65 @@ M7 release Clippy and builds with/without logging passed. This patch has not
 been flashed or hardware-tested. The initiating disconnect/link loss and any
 separate connected-port halt fault remain unproven; do not call them resolved.
 
+### SSE software validation — 2026-11-21
+
+The event/trace SSE implementation passed all 120 native tests (21 shared,
+74 M7, 25 M4), frontend formatting/lint/types, 68 web unit tests and 52 Chromium
+browser tests against the real gzip bundle and a loopback streaming fixture.
+Separate release Clippy and builds passed for each core with and without `defmt`.
+Coverage includes independent subscribers, admission/drop cleanup, cursor wrap,
+server filtering, cancelled reads/backoff, stalled connections, reboot-style
+continuity resets and a reset frame lost before acknowledgment.
+
+The logging-enabled ELF load ranges remain within their current flash banks;
+M7 ends at `0x080E33F0` and M4 at `0x0811AEF4`. M7 static RAM ends at
+`0x24072C90`, leaving about 53 KiB below the initial stack pointer. This is a
+layout check, not proof against stack overflow. No heap or memory boundary changed.
+The SSE images have not been flashed. On-board stream delivery, sustained USB/AP
+traffic, slow-client recovery and concurrent-client responsiveness remain NOT RUN.
+These checks do not resolve the initiating USB disconnect investigated above.
+
 ### Routes
 
 | Route | Request | Response |
 | --- | --- | --- |
 | `GET /` | — | Embedded HTML, `Content-Encoding: gzip`, `Cache-Control: no-cache`, ETag |
 | `POST /api/command` | `{command}` | 202 queued, 503 queue full |
-| `GET /api/events?after=0` | Wrapping `u32` cursor | `{records, cursor, dropped}` |
+| `GET /api/events` | Resume tokens, independent event/trace cursors and optional trace filters | SSE: `reset`, `events`, optional `trace`; comment heartbeats |
 | `GET /api/trace?after=0` | Cursor and optional trace filters | `{records:[{sequence,record}], cursor, dropped}` |
 
-JSON responses are uncompressed. Event responses use `Cache-Control: no-store`.
+JSON and SSE responses are uncompressed. SSE uses `Content-Type: text/event-stream`
+and picoserve's `Cache-Control: no-cache`; finite trace responses use `no-store`.
 Malformed/oversized request JSON is rejected; clients must not depend on
 picoserve’s diagnostic error-body text.
+
+`/api/events` uses picoserve's built-in SSE transport. Query fields are `after`,
+`trace_after` (wrapping `u32`, default zero), `trace` (default false), optional
+`client`, `attempt`, `resume` (at most 32 bytes each), and the trace filters below.
+Unknown or invalid fields return 400. `events` frames carry the existing
+`{records,cursor,dropped}` envelope; `trace` frames carry the sequence-bearing
+trace envelope. Both contain at most three records and 4096 JSON bytes. The initial
+events page is sent even if empty. Trace is opt-in and never narrows canonical
+events. The JSON `/api/trace` route remains available for finite requests.
+
+Each browser manual connection creates a 32-hex client token; every fetch creates
+a fresh 32-hex attempt. The browser echoes `resume` only after processing a
+`reset` frame containing `{"resume":"<attempt>"}`. M7 remembers two client/proof
+pairs in private RAM, independently of active subscriber ownership. A matching
+acknowledged proof resumes both supplied cursors. A missing/forgotten client or
+mismatched proof forces a reset and zero cursors. Lost reset frames must force
+another reset, never silently accept old cursors. A reboot or inactive-token
+eviction therefore clears stale browser state without requiring persistent
+firmware storage. These identifiers are not authentication. Clients omitting
+attempt/proof start fresh and receive `{"resume":null}`.
+
+Every subscriber has an independent, coalesced Embassy channel notification.
+Complete-record publication and assembly-loss changes wake all active subscribers;
+producers never await a browser. Dropping the stream releases its admission slot.
+M7 services both cursors fairly for at most eight turns per batch, then yields;
+when caught up it waits for notification or a two-second comment heartbeat.
+Each complete SSE frame/heartbeat has a five-second write deadline. Slow readers
+can lose bounded history; stream delivery is not lossless capture.
 
 `/api/trace` is an additive HTTP route; IPC/UI records and protocol version are
 unchanged. It scans at most the retained 64 board records and returns at most
@@ -617,10 +668,11 @@ Each record is `{timestamp_ms, event}`; `event.type` identifies the UI record.
 
 - IPC frames are at most 288 bytes. M4 serializes each UI record into ordered,
   retried chunks; M7 publishes only complete records up to 1024 bytes.
-- M7 retains 64 records. Each poll returns at most three; immediately drain full
-  pages, then back off when caught up. Pass the returned cursor on the next poll.
-- Cursors wrap as `u32`. A future cursor restarts at retained history; reset the
-  client cursor to zero for a new connection. Polling is non-destructive.
+- M7 retains 64 records. Each SSE page contains at most three; the server drains
+  available pages fairly, then waits for publication rather than polling.
+- Cursors wrap as `u32`. A future cursor restarts at retained history. Automatic
+  reconnects retain acknowledged cursors; manual Connect starts at zero. Delivery
+  is non-destructive and a continuity reset clears both cursor spaces.
 - `dropped` combines records missed since the supplied cursor with cumulative
   assembly overflow. It is a **latest loss snapshot**, not a delta or globally
   cumulative total; do not sum repeated values.
@@ -639,24 +691,35 @@ with empty SETUP denotes controller/idle context, not a real EP0 request.
 These records omit handshakes, CRCs and wire timing.
 
 All browser requests need deadlines covering body reads and external cancellation.
-Initial status failure must not prevent event polling; non-idempotent commands
+Initial status failure must not prevent event streaming; non-idempotent commands
 must not be automatically retried. Trace filtering must not change USB scheduling.
 
 ## Browser state and trace behavior
 
 
-`src/main.tsx` provides the QueryClient. Queries/mutations do not automatically
-retry, and window-focus refetching is disabled.
+`src/main.tsx` provides the QueryClient. TanStack retries and window-focus
+refetching are disabled; only the idempotent SSE transport reconnects itself.
 
-Event queries use a fresh session key and retain the cursor, not pages of trace
-data. This prevents cache refetches from replaying records. Each query drains
-at most eight three-record pages, then returns to the 150 ms polling interval.
-Listeners receive records immediately; the dashboard publishes once per batch.
-Do not replace this with unbounded infinite-query page accumulation. Initial
-status failure does not block polling. Requests and response-body reads have
-eight-second deadlines. Cancel/disconnect aborts active work; stale responses
-are ignored. Queries and mutations use `networkMode: 'always'` so browser
-Internet-availability hints do not pause requests to the local AP.
+One long-lived event query owns a fetch-based SSE stream, not an EventSource or
+an infinite-query page cache. TanStack's query AbortSignal is forwarded through
+linked controllers to fetch, body reads and retry waits; a separate session
+controller also cancels commands and downloads. Requests have eight-second header
+and per-read idle deadlines, not an eight-second total stream lifetime. The parser
+bounds each frame to 8192 encoded bytes, supports fragmented UTF-8/CRLF, and
+validates records before delivering them or committing cursors. Transient failures
+and EOF reconnect with 250-ms exponential backoff capped at five seconds; malformed
+frames/pages or incompatible protocol fail explicitly. Reconnect resumes only
+processed event/trace cursors and an acknowledged reset proof. A valid events page,
+not just response headers, establishes Connected. Initial status failure does not
+block the stream. Cancellation aborts reads, pending connections and backoff;
+obsolete session/filter callbacks cannot mutate state. Queries and mutations use
+`networkMode: 'always'` so browser Internet hints do not pause the local AP.
+
+Storage listeners run immediately on validated canonical records. Actual stream
+interruptions, continuity resets or increased canonical loss cancel downloads;
+deliberate filter restarts preserve the canonical cursor/listeners. A reset clears
+stale device/trace/loss state while preserving pause and filter choices. Histories
+stay bounded outside the query cache. No browser event/trace polling timer remains.
 
 Commands are mutations: HTTP **202 means queued, not executed**. Completion must
 be observed in events. Queue-full/rejected commands report an error and are never
@@ -677,7 +740,7 @@ automatically retried. Contracts and queue limits are specified above; use the p
   add client sorting/filtering, pagination or selection without a concrete need.
   Other descriptor/storage tables use the ordinary table components.
 - Trace rows use `@tanstack/solid-virtual` with dynamic height measurement and
-  stable sequence/transfer keys. Preserve the visible record offset when polling
+  stable sequence/transfer keys. Preserve the visible record offset when streaming
   prepends new records; fall back to a retained neighbor if that record is evicted.
   Expansion state is bounded by retained history. Split large transfer groups
   into bounded render rows without changing context association or exports.
@@ -689,13 +752,14 @@ automatically retried. Contracts and queue limits are specified above; use the p
   fresh session and replays available board history.
 - Endpoints belong to an interface/alternate setting. Partial topology remains
   inspectable after failure; a new device session clears stale state.
-- Filters and search run on M7 through an independent `/api/trace` cursor query,
-  not by matching browser history. Canonical `/api/events` continues unfiltered
-  for dashboard state, storage listeners and full-history exports. Changing filters
-  resets only the filtered cursor/history, cancels stale requests, and debounces
-  search by 200 ms. Filtered history is bounded to 500 records; queries use the
-  same eight-page batch budget. Searches cover retained board history, not older
-  browser-only records. Filters are disabled while paused or disconnected.
+- Filters and search run on M7, not by matching browser history. One SSE stream
+  multiplexes unfiltered `events` for state/storage/full exports and optional
+  server-selected `trace` frames with an independent cursor. Filter changes
+  debounce for 200 ms, reset only filtered history/cursor, and replace the stream
+  while preserving canonical progress and the reset proof. Filtered history is
+  bounded to 500 records; server batches use the same eight-turn fairness budget.
+  Searches cover retained board history, not older browser-only records. Filters
+  are disabled while paused or disconnected.
 - Endpoint filters match the full decimal address exactly (`0` differs from
   `128`); IN is device-to-host, OUT is host-to-device. Control, interrupt and bulk
   filter the transfer kind when context provides it; missing context is not

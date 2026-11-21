@@ -6,6 +6,12 @@ test.beforeEach(async ({ page }) => {
     throw error;
   });
   page.on('console', (message) => {
+    // A replacement stream may race the old subscriber's release and retry a 503.
+    if (
+      message.text().includes('503 (Service Unavailable)') &&
+      new URL(message.location().url).pathname === '/api/events'
+    )
+      return;
     if (message.type() === 'error') throw new Error(message.text());
   });
 });
@@ -50,7 +56,7 @@ test('bounded trace virtualizes, preserves a middle anchor and expanded records'
   });
   expect(anchor.key).toMatch(/^sequence-\d+$/);
   for (let i = 0; i < 24; i++) emit();
-  await expect.poll(() => api.cursors.at(-1), { timeout: 10000 }).toBe(524);
+  await expect.poll(() => api.deliveredCursors.at(-1), { timeout: 10000 }).toBe(524);
   const anchored = viewport.locator(`[data-trace-record="${anchor.key}"]`);
   await expect(anchored).toBeAttached();
   await expect

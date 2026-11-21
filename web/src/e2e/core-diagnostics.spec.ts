@@ -38,7 +38,7 @@ for (const initial of [true, false]) {
         page.locator('[data-sonner-toast]').filter({ hasText: 'Connected.' }),
       ).toHaveCount(0);
     api.emit({ type: 'error', message });
-    await expect.poll(() => api.cursors.at(-1)).toBe(3);
+    await expect.poll(() => api.deliveredCursors.at(-1)).toBe(3);
     await expect(toast).toHaveCount(1);
     if (!initial) await page.getByRole('button', { name: 'Resume display', exact: true }).click();
     await expect(errors).toHaveText('Errors1');

@@ -1,17 +1,29 @@
 import type { ProtocolRecord } from './protocol';
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { applyEventPage, createLossRefreshGuard, getEventPage, sendCommand } from './http';
+import {
+  applyEventPage,
+  createLossRefreshGuard,
+  getTracePage,
+  normalizeTraceFilters,
+  sendCommand,
+  validEventPage,
+} from './http';
 import { createState } from './protocol';
 const record: ProtocolRecord = { timestamp_ms: 0, event: { type: 'hello', protocol_version: 5 } };
 const response = (page: unknown) => Response.json(page);
+const filters = normalizeTraceFilters({
+  endpoint: '',
+  direction: '',
+  kind: '',
+  errors: false,
+  q: '',
+});
 
-test('page fetch uses supplied cursor and leaves reduction to the session', async () => {
+test('event page validation leaves reduction to the session', () => {
   const state = { ...createState(), transportDropped: 0 };
-  const page = await getEventPage(0xffffffff, new AbortController().signal, async (url) => {
-    assert.equal(url, '/api/events?after=4294967295');
-    return response({ records: [record], cursor: 1, dropped: 8 });
-  });
+  const page: unknown = { records: [record], cursor: 0xffffffff, dropped: 8 };
+  assert.ok(validEventPage(page));
   assert.equal(state.history.length, 0);
   applyEventPage(state, page);
   assert.equal(state.history.length, 0);
@@ -72,26 +84,41 @@ test('loss refresh guard detects increases, ignores persistent snapshots and rat
   assert.equal(refresh(1), true);
 });
 
-test('rejects invalid envelopes and HTTP errors without delivering a page', async () => {
+test('rejects invalid event envelopes before reduction', () => {
   for (const page of [
     null,
     { records: [record], cursor: -1, dropped: 0 },
+    { records: [], cursor: 0x100000000, dropped: 0 },
+    { records: [], cursor: 1.5, dropped: 0 },
+    { records: [], cursor: 0, dropped: -1 },
+    { records: [], cursor: 0, dropped: 0x100000000 },
+    { cursor: 0, dropped: 0 },
     { records: [null], cursor: 1, dropped: 0 },
     { records: Array(4).fill(record), cursor: 1, dropped: 0 },
   ]) {
-    await assert.rejects(
-      getEventPage(0, new AbortController().signal, async () => response(page)),
-      /Invalid events response/,
-    );
+    assert.equal(validEventPage(page), false);
   }
+  assert.equal(validEventPage({ records: [], cursor: 0, dropped: 0 }), true);
+});
+
+test('finite trace fetch uses the supplied cursor and rejects HTTP errors', async () => {
+  const signal = new AbortController().signal;
+  const page = { records: [], cursor: 1, dropped: 8 };
+  assert.deepEqual(
+    await getTracePage(0xffffffff, filters, signal, async (url) => {
+      assert.equal(url, '/api/trace?after=4294967295');
+      return response(page);
+    }),
+    page,
+  );
   await assert.rejects(
-    getEventPage(0, new AbortController().signal, async () => new Response(null, { status: 500 })),
+    getTracePage(0, filters, signal, async () => new Response(null, { status: 500 })),
     /HTTP 500/,
   );
 });
 
-test('command and event fetch deadlines abort stalled injected requests', async () => {
-  for (const kind of ['command', 'events']) {
+test('command and finite trace deadlines abort stalled injected requests', async () => {
+  for (const kind of ['command', 'trace']) {
     const controller = new AbortController();
     let requestSignal: AbortSignal | undefined;
     const stalled: typeof fetch = async (_, options) => {
@@ -101,20 +128,21 @@ test('command and event fetch deadlines abort stalled injected requests', async 
     const pending =
       kind === 'command'
         ? sendCommand('status', controller.signal, stalled, 10)
-        : getEventPage(0, controller.signal, stalled, 10);
+        : getTracePage(0, filters, controller.signal, stalled, 10);
     await assert.rejects(pending, /Diagnostic request timed out/);
     assert.equal(requestSignal?.aborted, true);
     assert.equal(controller.signal.aborted, false);
   }
 });
 
-test('event deadline includes JSON body and never delivers a late page', async () => {
+test('finite trace deadline includes JSON body and never delivers a late page', async () => {
   let finish!: (page: unknown) => void;
   let delivered = 0;
   let requestSignal: AbortSignal | undefined;
   await assert.rejects(
-    getEventPage(
+    getTracePage(
       0,
+      filters,
       new AbortController().signal,
       async (_, options) => {
         requestSignal = options?.signal ?? undefined;
@@ -135,7 +163,7 @@ test('event deadline includes JSON body and never delivers a late page', async (
 });
 
 test('external cancellation settles stalled requests and preserves abort reason', async () => {
-  for (const kind of ['command', 'events']) {
+  for (const kind of ['command', 'trace']) {
     const controller = new AbortController();
     const reason = new Error('Disconnected by user');
     let requestSignal: AbortSignal | undefined;
@@ -147,7 +175,7 @@ test('external cancellation settles stalled requests and preserves abort reason'
     const pending =
       kind === 'command'
         ? sendCommand('status', controller.signal, request, 1000)
-        : getEventPage(0, controller.signal, request, 1000);
+        : getTracePage(0, filters, controller.signal, request, 1000);
     await Promise.resolve();
     controller.abort(reason);
     await assert.rejects(pending, (error) => error === reason);
