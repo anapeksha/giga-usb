@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install web dependencies and Chromium
+        working-directory: web
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+      - name: Check dashboard
+        working-directory: web
+        run: npm run check:all
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+      - name: Test native libraries
+        run: |
+          cargo test -p shared --target x86_64-unknown-linux-gnu --lib --locked
+          cargo test -p m7 --target x86_64-unknown-linux-gnu --lib --locked
+          cargo test -p m4 --target x86_64-unknown-linux-gnu --lib --locked
+      - name: Check and build each core
+        run: |
+          for core in m4 m7; do
+            cargo clippy -p "$core" --release --locked -- -D warnings
+            cargo clippy -p "$core" --release --features defmt --locked -- -D warnings
+            cargo build -p "$core" --release --locked
+            cargo build -p "$core" --release --features defmt --locked
+          done

@@ -73,6 +73,71 @@ limitation. Do not hide diagnostics or silently split the workspace. Keep only
 the cargo-embed server task; CodeLLDB attaches to its GDB endpoint. Cargo-embed
 is a GDB server, not a DAP server.
 
+### GitHub CI and signed releases
+
+`.github/workflows/ci.yml` runs on pull requests and merge queues, without
+signing secrets. It checks the complete dashboard (including Chromium fixtures),
+Rust formatting, native libraries on Linux, and separate per-core release Clippy
+and builds with and without `defmt`. In the default-branch ruleset, require the
+**Validate** check and pull requests before merging. Workflow files alone do not
+enable repository rulesets. These checks are software evidence, not board tests.
+
+`.github/workflows/release.yml` runs only when a `vMAJOR.MINOR.PATCH` tag is
+pushed. It builds matching logging-enabled images and the dashboard, packages
+both ELFs, the gzip UI, checksums and build identity, then signs and verifies the
+archive with `imgtool` 2.5.0. Assets are uploaded to a draft GitHub Release before
+publication; no Actions artifacts are uploaded. Published releases are never
+replaced. A failed upload can be retried against the remaining draft.
+
+Before releasing, create the **release** GitHub environment with required
+reviewers and deployment restrictions allowing only trusted `v*` tags. Protect
+release-tag creation/update/deletion with a repository tag ruleset. A tag trigger
+alone does not prove the commit passed PR checks: release only reviewed commits
+from the protected default branch. Restrict who can modify workflows and approve
+releases. Add these environment settings:
+
+- Secret **FIRMWARE_SIGNING_KEY**: the complete, unencrypted Ed25519 private PEM.
+- Variable **FIRMWARE_SIGNING_PUBLIC_KEY**: its public PEM, maintained independently
+  so verification fails if the secret is replaced with a mismatched key.
+
+Generate the production key offline on a trusted machine, never in CI or inside
+the repository, and keep a secure backup. For example, with `imgtool` installed:
+
+```sh
+imgtool keygen --type ed25519 --key signing-private.pem
+imgtool getpub --key signing-private.pem --encoding pem --output signing-public.pem
+```
+
+Store only the private PEM in GitHub Secrets, never a release asset or issue.
+Publish the public-key fingerprint through an independently trusted channel;
+trusting a public key downloaded alongside an untrusted release is insufficient.
+The workflow removes its temporary private-key file on exit. Do not enable shell
+tracing for signing steps or expose the release environment to PR jobs.
+
+**This is distribution signing, not secure boot.** The board has no MCUboot
+verifier, and its vector tables must stay at the existing flash bases. Arduino
+CLI signing assumes an Arduino build/upload flow that this Rust project does not
+use. Instead, `giga-usb.signed.bin` is an explicitly non-bootable MCUboot-format
+container around `giga-usb.tar.gz`, with a 512-byte header. Its 64-MiB container
+limit is not a flash slot or permission to flash it. Never flash the container:
+verify it, compare its signed payload with the archive, then extract the original
+ELFs and follow the M4-then-M7 SWD procedure. With an independently trusted public
+key and all release assets in the current directory:
+
+```sh
+imgtool verify --key trusted-signing-public.pem giga-usb.signed.bin
+# Compare the archive to the exact payload covered by the verified signature.
+dd if=giga-usb.signed.bin bs=1 skip=512 count="$(wc -c < giga-usb.tar.gz)" | cmp - giga-usb.tar.gz
+mkdir firmware-release
+tar -xzf giga-usb.tar.gz -C firmware-release
+(cd firmware-release && sha256sum -c SHA256SUMS)
+```
+
+Stop if any verification fails. Checksums alone are not authentication. The
+current boot chain does not reject unsigned or modified firmware programmed over
+SWD; adding enforced secure boot would require a separate boot/memory-layout
+project. Decode release RTT using the exact corresponding ELF.
+
 ## Boot, memory and flashing
 
 - M7 flash: `0x08000000`, 1 MiB; private AXI SRAM: `0x24000000`, 512 KiB.
