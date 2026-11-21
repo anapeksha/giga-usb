@@ -1,8 +1,21 @@
 import { For, Show, createEffect, createMemo, createSignal, on, onCleanup } from 'solid-js';
 import { createVirtualizer } from '@tanstack/solid-virtual';
+import {
+  createSolidTable,
+  flexRender,
+  getCoreRowModel,
+  type VisibilityState,
+} from '@tanstack/solid-table';
+import { traceColumns } from './trace-columns';
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuCheckboxItem,
+} from './ui/dropdown-menu';
 import { traceRecordKey, viewportGroups, survivingAnchor } from '../lib/trace-viewport';
-import { hex, hostEvent, summary, type ProtocolRecord } from '../lib/protocol';
-import { decodeSetup, groupTrace } from '../lib/trace';
+import type { ProtocolRecord } from '../lib/protocol';
+import { groupTrace } from '../lib/trace';
 import type { TraceFilterInput } from '../lib/http';
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from './ui/card';
 import { Button } from './ui/button';
@@ -29,42 +42,6 @@ import {
 } from './ui/combobox';
 import { Table, TableHeader, TableBody, TableHead, TableRow, TableCell } from './ui/table';
 
-function TraceRecord(props: { record: ProtocolRecord }) {
-  const packet = () =>
-    props.record.event.type === 'host' ? hostEvent(props.record.event.event) : null;
-  const raw = () => {
-    const p = packet();
-    return p?.[0] === 'transfer' ? p[1].data : undefined;
-  };
-  const setup = () => {
-    const p = packet();
-    return p?.[0] === 'transfer' && p[1].pid === 3 ? decodeSetup(p[1].data) : undefined;
-  };
-  return (
-    <AccordionItem
-      value={traceRecordKey(props.record)}
-      data-trace-record={traceRecordKey(props.record)}
-    >
-      <AccordionTrigger class="gap-3 px-2 text-left font-mono text-xs">
-        {summary(props.record)}
-      </AccordionTrigger>
-      <AccordionContent>
-        <Show when={setup()}>{(text) => <p class="px-2 py-2 text-sm">{text()}</p>}</Show>
-        <pre class="m-2 rounded bg-muted p-3">{JSON.stringify(props.record, null, 2)}</pre>
-        <Show when={raw()}>
-          {(bytes) => (
-            <pre class="m-2 rounded bg-muted p-3">
-              RAW BYTES ({bytes().length}){'\n'}
-              {bytes()
-                .map((value) => hex(value).slice(2))
-                .join(' ')}
-            </pre>
-          )}
-        </Show>
-      </AccordionContent>
-    </AccordionItem>
-  );
-}
 function TraceFilter(props: {
   label: string;
   options: string[];
@@ -152,6 +129,24 @@ export function Trace(props: {
   });
   const newest = createMemo(() => groupTrace(records()).reverse());
   const rows = createMemo(() => viewportGroups(newest()));
+  const [columnVisibility, setColumnVisibility] = createSignal<VisibilityState>({});
+  const table = createSolidTable({
+    get data() {
+      return rows();
+    },
+    columns: traceColumns({ expanded, setExpanded }),
+    getCoreRowModel: getCoreRowModel(),
+    getRowId: (row) => row.key,
+    enableSorting: false,
+    enableColumnFilters: false,
+    enableRowSelection: false,
+    onColumnVisibilityChange: setColumnVisibility,
+    state: {
+      get columnVisibility() {
+        return columnVisibility();
+      },
+    },
+  });
   const filterKey = createMemo(() =>
     JSON.stringify([endpoint(), direction(), kind(), errors(), search()]),
   );
@@ -205,7 +200,7 @@ export function Trace(props: {
     onChange: rememberAnchor,
   });
   createEffect(
-    on([rows, filterKey], ([next, filter], previous) => {
+    on([rows, filterKey, columnVisibility], ([next, filter, visibility], previous) => {
       const update = ++revision;
       const reset = previous !== undefined && previous[1] !== filter;
       const oldKeys = committedRows.map((row) => row.key);
@@ -214,6 +209,11 @@ export function Trace(props: {
       restoring = true;
       queueMicrotask(() => {
         if (disposed || update !== revision) return;
+        if (previous && previous[2] !== visibility) {
+          virtualizer.measure();
+          for (const element of viewport.querySelectorAll<HTMLTableRowElement>('[data-row-key]'))
+            virtualizer.measureElement(element);
+        }
         if (reset || follow || !next.length) {
           virtualizer.scrollToOffset(0);
         } else if (saved) {
@@ -273,6 +273,27 @@ export function Trace(props: {
           </CardDescription>
         </div>
         <div class="flex flex-wrap gap-2">
+          <DropdownMenu placement="bottom-end" modal={false}>
+            <DropdownMenuTrigger as={Button<'button'>} variant="outline" size="sm">
+              Columns
+            </DropdownMenuTrigger>
+            <DropdownMenuContent aria-label="Trace columns">
+              <For each={table.getAllLeafColumns().filter((column) => column.getCanHide())}>
+                {(column) => (
+                  <DropdownMenuCheckboxItem
+                    checked={column.getIsVisible()}
+                    onChange={(visible) => {
+                      rememberAnchor();
+                      column.toggleVisibility(visible);
+                    }}
+                    closeOnSelect={false}
+                  >
+                    {column.id === 'time' ? 'Time' : (column.columnDef.header as string)}
+                  </DropdownMenuCheckboxItem>
+                )}
+              </For>
+            </DropdownMenuContent>
+          </DropdownMenu>
           <Button variant="outline" size="sm" onClick={props.togglePaused}>
             {props.paused ? 'Resume display' : 'Pause display'}
           </Button>
@@ -401,26 +422,37 @@ export function Trace(props: {
             wrapperClass="overflow-visible"
             class="min-w-160 table-fixed"
             aria-rowcount={Math.max(1, rows().length) + 1}
+            aria-colcount={table.getVisibleLeafColumns().length}
           >
             <colgroup>
-              <col class="w-24" />
-              <col class="w-20" />
-              <col class="w-28" />
-              <col />
+              <For each={table.getVisibleLeafColumns()}>
+                {(column) => (
+                  <col
+                    style={column.id === 'details' ? undefined : { width: `${column.getSize()}px` }}
+                  />
+                )}
+              </For>
             </colgroup>
             <caption class="sr-only">USB transfers and diagnostics</caption>
             <TableHeader>
-              <TableRow aria-rowindex={1}>
-                <TableHead scope="col">Time (ms)</TableHead>
-                <TableHead scope="col">Endpoint</TableHead>
-                <TableHead scope="col">Transfer</TableHead>
-                <TableHead scope="col">Details</TableHead>
-              </TableRow>
+              <For each={table.getHeaderGroups()}>
+                {(headerGroup) => (
+                  <TableRow aria-rowindex={1}>
+                    <For each={headerGroup.headers}>
+                      {(header) => (
+                        <TableHead scope="col" colSpan={header.colSpan}>
+                          {flexRender(header.column.columnDef.header, header.getContext())}
+                        </TableHead>
+                      )}
+                    </For>
+                  </TableRow>
+                )}
+              </For>
             </TableHeader>
             <TableBody>
               <TableRow aria-hidden="true" class="border-0 hover:bg-transparent">
                 <TableCell
-                  colSpan={4}
+                  colSpan={table.getVisibleLeafColumns().length}
                   class="border-0 p-0"
                   style={{ height: `${Math.max(0, firstStart() - 40)}px` }}
                 />
@@ -429,7 +461,7 @@ export function Trace(props: {
                 each={virtualRows().map((item) => item.key)}
                 fallback={
                   <TableRow aria-rowindex={2}>
-                    <TableCell colSpan={4} class="empty p-5">
+                    <TableCell colSpan={table.getVisibleLeafColumns().length} class="empty p-5">
                       No matching events. Connect and start USB, or adjust the filters.
                     </TableCell>
                   </TableRow>
@@ -437,10 +469,10 @@ export function Trace(props: {
               >
                 {(key) => {
                   const index = () => rows().findIndex((row) => row.key === key);
-                  const group = createMemo(() => rows()[index()]);
+                  const row = createMemo(() => table.getRowModel().rowsById[key]);
                   return (
-                    <Show when={group()}>
-                      {(group) => (
+                    <Show when={row()}>
+                      {(row) => (
                         <TableRow
                           ref={(element) => {
                             queueMicrotask(() => {
@@ -451,42 +483,21 @@ export function Trace(props: {
                           data-index={index()}
                           data-row-key={key}
                           aria-rowindex={index() + 2}
-                          classList={{ 'text-destructive': group().error }}
+                          classList={{ 'text-destructive': row().original.error }}
                         >
-                          <TableCell class="align-top font-mono text-xs tabular-nums">
-                            {group().records[0].timestamp_ms.toLocaleString()}
-                          </TableCell>
-                          <TableCell class="align-top font-mono text-xs">
-                            {group().endpoint ?? '—'}
-                          </TableCell>
-                          <TableCell class="align-top text-xs">
-                            {group().kind ?? '—'}
-                            {group().direction ? ` · ${group().direction!.toUpperCase()}` : ''}
-                          </TableCell>
-                          <TableCell class="overflow-hidden p-0 [&_pre]:overflow-auto">
-                            <Accordion
-                              multiple
-                              collapsible
-                              value={group()
-                                .records.map(traceRecordKey)
-                                .filter((key) => expanded().has(key))}
-                              onChange={(values) =>
-                                setExpanded((previous) => {
-                                  const next = new Set(previous);
-                                  for (const record of group().records) {
-                                    const key = traceRecordKey(record);
-                                    if (values.includes(key)) next.add(key);
-                                    else next.delete(key);
-                                  }
-                                  return next;
-                                })
-                              }
-                            >
-                              <For each={group().records}>
-                                {(record) => <TraceRecord record={record} />}
-                              </For>
-                            </Accordion>
-                          </TableCell>
+                          <For each={row().getVisibleCells()}>
+                            {(cell) => (
+                              <TableCell
+                                class={
+                                  cell.column.id === 'details'
+                                    ? 'overflow-hidden p-0 [&_pre]:overflow-auto'
+                                    : 'align-top'
+                                }
+                              >
+                                {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                              </TableCell>
+                            )}
+                          </For>
                         </TableRow>
                       )}
                     </Show>
@@ -495,7 +506,7 @@ export function Trace(props: {
               </For>
               <TableRow aria-hidden="true" class="border-0 hover:bg-transparent">
                 <TableCell
-                  colSpan={4}
+                  colSpan={table.getVisibleLeafColumns().length}
                   class="border-0 p-0"
                   style={{ height: `${Math.max(0, virtualizer.getTotalSize() - lastEnd())}px` }}
                 />

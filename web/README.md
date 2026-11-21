@@ -29,8 +29,13 @@ parsed input/descriptors, storage replies and unscoped processor errors still up
 dashboard state but do not consume trace history or appear in its JSON export.
 Exports are oldest-first. A browser-local `sequence` field counts all validated
 arrivals, including omitted records, to prevent false context/packet adjacency.
-The virtualized table renders visible rows only and preserves your reading position
-as new records arrive. Expanded details stay open when scrolled out of view and back.
+The trace follows the solid-ui Data Table guide: explicit TanStack Solid Table
+columns and a core row model render over the existing Table primitives, with
+`@tanstack/solid-virtual` rendering visible rows only. **Columns** toggles optional
+**Time**, **Endpoint**, and **Transfer** columns; **Details** is always visible.
+Column visibility changes remeasure virtual rows. Reading position is preserved
+as new records arrive, and expanded details stay open when scrolled out of view
+and back. Other dashboard tables continue to use the normal Table primitives.
 Device details scroll within a bounded panel. Identification is labeled as a likely
 USB ID/class match or text reported by storage, not verified make/model detection.
 
@@ -53,8 +58,10 @@ unfiltered browser-history export. Resume and connect before changing filters.
 - **Errors only** shows USB errors and diagnostics, with compatible context.
 - **Search** matches summaries, decoded requests and hex bytes. Search is limited
   to 96 UTF-8 bytes.
-  The trace uses a semantic table with `@tanstack/solid-virtual`. Display sorting and
-  pagination are intentionally omitted to preserve transfer order and adjacent context.
+  The trace retains semantic table headers and row/column counts. Client-side filtering,
+  sorting and pagination are intentionally omitted to preserve transfer order and adjacent
+  context. Row selection and column resizing are omitted: export already covers trace
+  history, and optional-column visibility provides a simpler way to make room for details.
   Event polling remains cursor-based: each query drains at most eight bounded pages
   before returning to its polling interval, without caching pages of trace history.
 
