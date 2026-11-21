@@ -19,10 +19,11 @@ handshakes, CRCs, bus timing and arbitrary external traffic are not captured.
 - Shared contains only protocol, IPC, logging and Wi-Fi contracts, USB types,
   and shared HAL metadata. Its only feature is `defmt`; there are no `m7`/`m4`
   selectors.
-- M7's native-testable library owns `firmware/m7/src/{status,network_bus}.rs`
+- M7's native-testable library owns `firmware/m7/src/{status,network_bus,ipc_delivery}.rs`
   and `firmware/m7/src/usb/{host,host_logic,host_storage,storage}.rs`.
   `firmware/m7/src/boot.rs` owns M7-specific boot coordination and M4 validation.
-- M4's native-testable library owns `firmware/m4/src/usb/{processor,hid}.rs`;
+- M4's native-testable library owns `firmware/m4/src/ui_bus.rs` and
+  `firmware/m4/src/usb/{processor,hid}.rs`;
   `firmware/m4/src/boot.rs` owns M4-specific boot adoption.
 - M7 owns USB_OTG_HS with its internal full-speed PHY, PB14/PB15, PA15 VBUS,
   SDMMC1, PB10, PC8–PC12/PD2, RGB LED PI12/PJ13/PE3 and TIM2.
@@ -155,6 +156,21 @@ BSP's atomic SPSC queues in SRAM4. Shared `ipc_delivery` helpers use
 `NoopRawMutex` only within one cooperative executor: never put these channels in
 shared SRAM, access them from another core, or use them in interrupt handlers.
 
+M7 executes HTTP host commands locally, without relaying them through M4. Its
+host service handles at most four commands/messages per turn and alternates local
+HTTP and incoming CDC work when both are queued, preserving FIFO within each
+source. Ordering across independent sources is not transactional. HTTP Status
+emits fresh host status and coalesces a separate M4 snapshot request; M4 handles
+that request without echoing Status back. CDC Status snapshots on M4 and forwards
+once to M7 for fresh host status. Snapshot requests and captures alternate on
+outbound IPC when both are queued, preventing snapshot traffic from starving USB
+records. Registers and USB scheduling remain exclusively owned by the host task.
+
+IPC transport failures are generic platform diagnostics, not USB transaction
+errors: do not increment USB error counters or invent channel snapshots. M7's
+IPC task publishes cumulative transport failures at most once per second. Browser
+notices surface those errors separately from USB counts and USB trace history.
+
 M7 retains 64 capture frames plus one in flight, and four incoming messages plus
 one held under backpressure. M4 independently retains 64 network and 64 serial
 records, four commands, a 1024-byte JSON record and one in-flight IPC chunk.
@@ -170,6 +186,13 @@ records by evicting the oldest queued raw record where possible, and count actua
 loss when a record is abandoned. Keep serial and network losses separate; an
 absent or slow serial client must not hold up HTTP. Native queue tests model
 backpressure but do not establish hardware throughput or lossless capture.
+
+M4 tracks each in-progress network record until its final chunk is accepted.
+Abandoning a loss notification restores its original count, not one; an ordinary
+abandoned record counts once. Serial serialization/write failures use the serial
+counter only. DTR changes deliberately dispose of old serial-session queued
+history; reconnect snapshots target serial only and must not trigger network
+snapshot bursts.
 
 ## Wi-Fi and HTTP
 
@@ -462,10 +485,12 @@ Commands use serde's externally tagged representation:
 {"command":{"storage_read":{"file":0,"offset":128}}}
 ```
 
-**202 is queue acceptance, not completion.** Commands travel HTTP → M7 → M4 →
-M7 host; execution produces asynchronous events. `status` requests the processor
-snapshot and fresh host status. Start powers USB-A; browser Disconnect does not
-stop it. Invalid command names are rejected during deserialization.
+**202 is queue acceptance, not completion.** HTTP commands go directly to the
+M7 host's local bounded queue; CDC commands travel M4 → M7. Execution produces
+asynchronous events. `status` requests fresh M7 host status and a separate retained
+M4 processor snapshot. There is no M4 round trip for HTTP Start/Stop/Reset or
+storage execution. Start powers USB-A; browser Disconnect does not stop it.
+Invalid command names are rejected during deserialization.
 
 Storage uses an index from the most recent listing, not a path. Read responses
 contain up to 128 bytes and identify index, offset, size and EOF. Downloads must
