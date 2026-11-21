@@ -147,6 +147,30 @@ Keep IPC frames within 288 bytes and UI records within their assembly limit.
 Host-capture drops, M4 queue drops and browser history loss are different metrics;
 do not overwrite or repeatedly sum unrelated counters.
 
+Each core has one dedicated IPC task that exclusively owns its endpoint. Private
+`embassy-sync` channels queue work independently of USB register polling and
+serial writes; an in-flight frame is retained unchanged until the transport
+accepts it. `Full` retries are not drops. The cross-core transport remains the
+BSP's atomic SPSC queues in SRAM4. Shared `ipc_delivery` helpers use
+`NoopRawMutex` only within one cooperative executor: never put these channels in
+shared SRAM, access them from another core, or use them in interrupt handlers.
+
+M7 retains 64 capture frames plus one in flight, and four incoming messages plus
+one held under backpressure. M4 independently retains 64 network and 64 serial
+records, four commands, a 1024-byte JSON record and one in-flight IPC chunk.
+M7 delivery state is bounded to 20 KiB and M4's UI bus to 24 KiB. At packet-safe
+boundaries, M7 may yield up to 2 ms for backlog draining, without extending the
+transfer deadline; command service continues. Never wait for queue capacity while
+an active USB packet needs RX servicing. M4 polls the cross-core slot at bounded
+25 µs intervals rather than imposing a 1 ms delay per frame; these are polling
+intervals, not execution-time guarantees.
+
+Sustained consumer stalls can still exhaust bounded queues. Preserve semantic
+records by evicting the oldest queued raw record where possible, and count actual
+loss when a record is abandoned. Keep serial and network losses separate; an
+absent or slow serial client must not hold up HTTP. Native queue tests model
+backpressure but do not establish hardware throughput or lossless capture.
+
 ## Wi-Fi and HTTP
 
 Networking is AP-only: start the open `GigaUSB` AP at `192.168.4.1` with
@@ -185,6 +209,12 @@ Use straightforward code, imports at the top, small understandable functions and
 existing patterns. No speculative frameworks, redundant helpers, Python scripts,
 extra editor tasks or comments that restate the code. Preserve user changes.
 Implement only features that advance the USB host/diagnostic goal.
+
+Use atomic, unscoped Conventional Commit subjects: `feat: ...`, `fix: ...`,
+`chore: ...`, `test: ...`, `docs: ...` or `refactor: ...`. Do not use parenthesized
+scopes such as `feat(ai): ...` or `fix(usb): ...`. Each commit should contain one
+cohesive change and its directly related tests or documentation; leave unrelated
+user edits out of it.
 
 Do not change the development Mac's Wi-Fi connection: it disconnects the agent.
 Use a separate client for AP/browser validation. Local browser fixtures can test
@@ -504,6 +534,12 @@ automatically retried. Contracts and queue limits are specified above; use the p
   or exports. Browser-local arrival sequence preserves original context/payload
   adjacency across omitted updates. Display is newest-first; JSON exports are
   oldest-first. Exports can contain sensitive input.
+- The USB trace follows solid-ui's data-table pattern using
+  `@tanstack/solid-table` over the normal table components. Enable only relevant
+  column visibility controls: Time, Endpoint and Transfer may be hidden; Details
+  remains required. Keep server-side filtering and chronological order; do not
+  add client sorting/filtering, pagination or selection without a concrete need.
+  Other descriptor/storage tables use the ordinary table components.
 - Trace rows use `@tanstack/solid-virtual` with dynamic height measurement and
   stable sequence/transfer keys. Preserve the visible record offset when polling
   prepends new records; fall back to a retained neighbor if that record is evicted.
