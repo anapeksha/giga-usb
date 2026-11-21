@@ -31,7 +31,7 @@ export default function App() {
     <main class="mx-auto max-w-360 px-4 py-7 sm:px-8">
       <header class="mb-6 flex flex-wrap items-center justify-between gap-4">
         <div>
-          <h1 class="text-2xl font-semibold tracking-tight">GigaUSB</h1>
+          <h1 class="text-2xl font-semibold tracking-tight">Giga USB</h1>
         </div>
         <div class="flex items-center gap-4">
           <span class="transport" classList={{ online: http.connected() }}>
