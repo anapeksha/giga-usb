@@ -1211,6 +1211,7 @@ version = "0.1.0"
 dependencies = [
  "defmt 1.2.0",
  "embassy-stm32",
+ "embassy-sync",
  "giga-r1",
  "heapless 0.9.3",
  "postcard",

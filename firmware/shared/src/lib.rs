@@ -11,6 +11,7 @@ use core::mem::{MaybeUninit, size_of};
 use embassy_stm32::SharedData;
 
 pub mod ipc;
+pub mod ipc_delivery;
 pub mod logging;
 
 pub mod protocol;
