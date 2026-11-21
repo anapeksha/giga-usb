@@ -82,33 +82,56 @@ and builds with and without `defmt`. In the default-branch ruleset, require the
 **Validate** check and pull requests before merging. Workflow files alone do not
 enable repository rulesets. These checks are software evidence, not board tests.
 
-`.github/workflows/release.yml` runs only when a `vMAJOR.MINOR.PATCH` tag is
-pushed. It builds matching logging-enabled images and the dashboard, packages
-both ELFs, the gzip UI, checksums and build identity, then signs and verifies the
-archive with `imgtool` 2.5.0. Assets are uploaded to a draft GitHub Release before
-publication; no Actions artifacts are uploaded. Published releases are never
-replaced. A failed upload can be retried against the remaining draft.
+`.github/workflows/release.yml` runs on GitHub Release `created`, checks out
+that release's tag, and builds matching logging-enabled images and dashboard.
+It packages both ELFs, the gzip UI, checksums and build identity, then signs and
+verifies the archive with `imgtool` 2.5.0. `softprops/action-gh-release@v3` uploads
+only release assets, without replacing existing assets; no Actions artifacts are
+uploaded. Actions use major-version references. Tags are not semver-validated:
+asset names include a filename-safe tag (non-ASCII/non-alphanumeric characters
+other than `.`, `_` and `-` become `-`), while signed `BUILD.txt` retains the exact
+tag and commit. The non-bootable imgtool container uses version `0.0.0`; it is
+not an application version or anti-rollback counter.
+
+GitHub does not trigger `created` workflows for draft releases. Create a release
+directly rather than saving a draft first; use `published` instead if draft-to-
+published transitions must be covered. This post-creation asset upload is not
+compatible with immutable releases: those require a draft-first upload workflow
+before publication.
 
 Before releasing, create the **release** GitHub environment with required
-reviewers and deployment restrictions allowing only trusted `v*` tags. Protect
-release-tag creation/update/deletion with a repository tag ruleset. A tag trigger
+reviewers and deployment restrictions allowing only trusted release tags. Protect
+release-tag creation/update/deletion with a repository tag ruleset. A release trigger
 alone does not prove the commit passed PR checks: release only reviewed commits
 from the protected default branch. Restrict who can modify workflows and approve
 releases. Add these environment settings:
 
 - Secret **FIRMWARE_SIGNING_KEY**: the complete, unencrypted Ed25519 private PEM.
-- Variable **FIRMWARE_SIGNING_PUBLIC_KEY**: its public PEM, maintained independently
+- Secret **FIRMWARE_SIGNING_PUBLIC_KEY**: its public PEM, maintained independently
   so verification fails if the secret is replaced with a mismatched key.
 
 Generate the production key offline on a trusted machine, never in CI or inside
 the repository, and keep a secure backup. For example, with `imgtool` installed:
 
 ```sh
-imgtool keygen --type ed25519 --key signing-private.pem
-imgtool getpub --key signing-private.pem --encoding pem --output signing-public.pem
+python3 -m venv signing-tools
+signing-tools/bin/pip install imgtool==2.5.0
+umask 077
+signing-tools/bin/imgtool keygen --type ed25519 --key signing-private.pem
+signing-tools/bin/imgtool getpub --key signing-private.pem --encoding pem --output signing-public.pem
 ```
 
-Store only the private PEM in GitHub Secrets, never a release asset or issue.
+In GitHub Settings → Environments → release → Environment secrets, add each
+complete PEM file under the secret names above. Alternatively, from that trusted
+machine with GitHub CLI authenticated:
+
+```sh
+gh secret set FIRMWARE_SIGNING_KEY --env release --repo anapeksha/giga-usb < signing-private.pem
+gh secret set FIRMWARE_SIGNING_PUBLIC_KEY --env release --repo anapeksha/giga-usb < signing-public.pem
+```
+
+Both PEMs are stored in Secrets; only the public PEM is intentionally included
+in release assets. Never upload the private PEM as a release asset or issue.
 Publish the public-key fingerprint through an independently trusted channel;
 trusting a public key downloaded alongside an untrusted release is insufficient.
 The workflow removes its temporary private-key file on exit. Do not enable shell
@@ -117,19 +140,21 @@ tracing for signing steps or expose the release environment to PR jobs.
 **This is distribution signing, not secure boot.** The board has no MCUboot
 verifier, and its vector tables must stay at the existing flash bases. Arduino
 CLI signing assumes an Arduino build/upload flow that this Rust project does not
-use. Instead, `giga-usb.signed.bin` is an explicitly non-bootable MCUboot-format
-container around `giga-usb.tar.gz`, with a 512-byte header. Its 64-MiB container
+use. Instead, `giga-usb-<tag>.signed.bin` is an explicitly non-bootable MCUboot-format
+container around `giga-usb-<tag>.tar.gz`, with a 512-byte header. Its 64-MiB container
 limit is not a flash slot or permission to flash it. Never flash the container:
 verify it, compare its signed payload with the archive, then extract the original
 ELFs and follow the M4-then-M7 SWD procedure. With an independently trusted public
-key and all release assets in the current directory:
+key and all release assets in the current directory (replace `v1.0.0` with the
+filename-safe tag from the downloaded asset):
 
 ```sh
-imgtool verify --key trusted-signing-public.pem giga-usb.signed.bin
+asset=giga-usb-v1.0.0
+imgtool verify --key trusted-signing-public.pem "$asset.signed.bin"
 # Compare the archive to the exact payload covered by the verified signature.
-dd if=giga-usb.signed.bin bs=1 skip=512 count="$(wc -c < giga-usb.tar.gz)" | cmp - giga-usb.tar.gz
+dd if="$asset.signed.bin" bs=1 skip=512 count="$(wc -c < "$asset.tar.gz")" | cmp - "$asset.tar.gz"
 mkdir firmware-release
-tar -xzf giga-usb.tar.gz -C firmware-release
+tar -xzf "$asset.tar.gz" -C firmware-release
 (cd firmware-release && sha256sum -c SHA256SUMS)
 ```
 
