@@ -146,6 +146,7 @@ async fn tx_task(mut tx: Sender<'static, UsbDriver>, bus: &'static Bus) {
             // this buffer. Prefix newline resynchronizes a partial JSON line.
             json[0] = b'\n';
             let Ok(n) = serde_json_core::to_slice(&record, &mut json[1..2047]) else {
+                bus.serial_failed(record);
                 bus.error("UI record exceeds JSON buffer");
                 continue;
             };
@@ -167,6 +168,7 @@ async fn tx_task(mut tx: Sender<'static, UsbDriver>, bus: &'static Bus) {
             match select(write, Timer::after_millis(250)).await {
                 Either::First(Ok(())) => {}
                 Either::First(Err(_)) => {
+                    bus.serial_failed(record);
                     bus.connection(false);
                     break;
                 }

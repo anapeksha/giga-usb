@@ -42,7 +42,7 @@ async fn ipc_task(
             incoming_command = bus.accept_command(command).err();
         }
         if bus.take_replay() {
-            processor.snapshot(|event| bus.emit(Instant::now().as_millis(), event));
+            bus.replay_serial(processor);
         }
         // Drain RX independently of TX. If command admission is full, retain
         // that command and apply backpressure rather than consuming it twice.
@@ -59,7 +59,9 @@ async fn ipc_task(
                         Err(_) => bus.error("Malformed IPC capture"),
                     },
                     Event::Command => match message.decode::<HostCommand>() {
-                        Ok(command) => incoming_command = bus.accept_command(command).err(),
+                        Ok(command) => {
+                            incoming_command = bus.accept_ipc_command(command, processor).err();
+                        }
                         Err(_) => bus.error("Malformed network command"),
                     },
                     Event::Ping if pending.is_none() => {
@@ -103,6 +105,8 @@ async fn ipc_task(
                 bus.network_failed();
             }
             bus.error("IPC send failed");
+        } else if event == Some(Event::Ui) && pending.is_none() {
+            bus.network_frame_sent();
         }
         // No cross-core waker: bound idle/full polling without imposing a
         // millisecond of latency on each single-slot frame/chunk.

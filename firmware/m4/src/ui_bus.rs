@@ -17,6 +17,7 @@ struct Queues {
     network_json: Vec<u8, { RECORD_BYTES }>,
     network_offset: usize,
     network_dropped: u32,
+    network_loss_weight: u32,
     input: shared::ipc_delivery::Queue<HostCommand, 4>,
     connected: bool,
     replay: bool,
@@ -71,6 +72,7 @@ impl Bus {
                 network_json: Vec::new(),
                 network_offset: 0,
                 network_dropped: 0,
+                network_loss_weight: 0,
                 input: shared::ipc_delivery::Queue::new(),
                 connected: false,
                 replay: false,
@@ -89,6 +91,11 @@ impl Bus {
         };
         let dropped = queue_record(&q.network, record);
         q.network_dropped = q.network_dropped.saturating_add(dropped);
+        drop(q);
+        self.emit_serial(timestamp_ms, event);
+    }
+    pub fn emit_serial(&self, timestamp_ms: u64, event: UiEvent) {
+        let mut q = self.0.borrow_mut();
         if !q.connected {
             return;
         }
@@ -117,7 +124,31 @@ impl Bus {
     pub fn network_failed(&self) {
         let mut q = self.0.borrow_mut();
         q.network_json.clear();
-        q.network_dropped = q.network_dropped.saturating_add(1);
+        let lost = take(&mut q.network_loss_weight);
+        q.network_dropped = q.network_dropped.saturating_add(lost);
+    }
+    /// Acknowledge only after Pending has accepted the exact chunk, not on Full.
+    pub fn network_frame_sent(&self) {
+        let mut q = self.0.borrow_mut();
+        if q.network_json.is_empty() {
+            q.network_loss_weight = 0;
+        }
+    }
+    pub fn replay_serial(&self, processor: &crate::usb::processor::Processor) {
+        processor.snapshot(|event| self.emit_serial((self.1)(), event));
+    }
+    /// IPC Status requests an M4 snapshot; it must not echo back to M7.
+    pub fn accept_ipc_command(
+        &self,
+        command: HostCommand,
+        processor: &crate::usb::processor::Processor,
+    ) -> Result<(), HostCommand> {
+        if command == HostCommand::Status {
+            processor.snapshot(|event| self.emit((self.1)(), event));
+            Ok(())
+        } else {
+            self.accept_command(command)
+        }
     }
     pub fn command(&self) -> Option<HostCommand> {
         self.0.borrow().input.pop_front()
@@ -140,12 +171,17 @@ impl Bus {
             } else {
                 q.network.pop_front()?
             };
+            q.network_loss_weight = match record.event {
+                UiEvent::Dropped { count } => count,
+                _ => 1,
+            };
             q.network_json.resize(RECORD_BYTES, 0).ok()?;
             match serde_json_core::to_slice(&record, &mut q.network_json) {
                 Ok(n) => q.network_json.truncate(n),
                 Err(_) => {
                     q.network_json.clear();
-                    q.network_dropped = q.network_dropped.saturating_add(1);
+                    let lost = take(&mut q.network_loss_weight);
+                    q.network_dropped = q.network_dropped.saturating_add(lost);
                     return None;
                 }
             }
@@ -168,6 +204,8 @@ impl Bus {
         if q.connected != connected {
             q.connected = connected;
             q.generation = q.generation.wrapping_add(1);
+            // DTR changes dispose of the old serial session's queued history.
+            // Unexpected in-flight delivery failures are counted separately.
             q.output.clear();
             q.replay = connected;
         }
@@ -224,6 +262,7 @@ mod tests {
         let mut started = false;
         loop {
             let frame = bus.network_frame().expect("record queued");
+            bus.network_frame_sent();
             let payload = frame.value.unwrap();
             assert_eq!(payload[0] & 1 != 0, !started);
             started = true;
@@ -280,8 +319,10 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+        bus.network_frame_sent();
         loop {
             let frame = bus.network_frame().unwrap();
+            bus.network_frame_sent();
             let payload = frame.value.unwrap();
             assert_eq!(payload[0] & 1, 0);
             assembly.extend_from_slice(&payload[1..]).unwrap();
@@ -368,6 +409,120 @@ mod tests {
         }
         assert_eq!(bus.command(), Some(HostCommand::Stop));
         assert!(bus.command().is_none());
+    }
+
+    #[test]
+    fn terminal_failure_at_each_chunk_restores_exact_loss_weight() {
+        for failed_chunk in 0..3 {
+            let bus = Bus::new(|| 0);
+            // Trailing JSON whitespace exercises three chunks without changing
+            // the record, including a genuinely intermediate chunk.
+            {
+                let mut q = bus.0.borrow_mut();
+                q.network_json = record(1, raw(255));
+                q.network_json.resize(700, b' ').unwrap();
+                q.network_loss_weight = 1;
+            }
+            bus.emit(2, raw(254));
+            for chunk in 0..=failed_chunk {
+                let frame = bus.network_frame().unwrap();
+                let mut pending = Pending::new();
+                pending.set(Some(frame.clone()));
+                for _ in 0..10 {
+                    pending
+                        .retry(|retry| {
+                            assert_eq!(retry, &frame);
+                            Err(SendError::Full)
+                        })
+                        .unwrap();
+                    assert!(!pending.is_none());
+                    assert_eq!(bus.0.borrow().network_loss_weight, 1);
+                    assert_eq!(bus.0.borrow().network_dropped, 0);
+                }
+                if chunk == failed_chunk {
+                    assert!(
+                        pending
+                            .retry(|_| Err(SendError::Transport(
+                                shared::ipc::QueueError::StaleEndpoint
+                            )))
+                            .is_err()
+                    );
+                    assert!(pending.is_none());
+                    bus.network_failed();
+                } else {
+                    pending.retry(|_| Ok(())).unwrap();
+                    bus.network_frame_sent();
+                }
+            }
+            assert_eq!(next_record(&bus), record(0, UiEvent::Dropped { count: 1 }));
+            assert_eq!(next_record(&bus), record(2, raw(254)));
+            assert!(bus.network_frame().is_none());
+        }
+    }
+
+    #[test]
+    fn failed_drop_marker_preserves_original_count_and_new_losses() {
+        let bus = Bus::new(|| 0);
+        bus.0.borrow_mut().network_dropped = 37;
+        let frame = bus.network_frame().unwrap();
+        assert_eq!(frame.value.as_ref().unwrap()[0], 3);
+        let mut pending = Pending::new();
+        pending.set(Some(frame.clone()));
+        for _ in 0..10 {
+            pending
+                .retry(|retry| {
+                    assert_eq!(retry, &frame);
+                    Err(SendError::Full)
+                })
+                .unwrap();
+        }
+        bus.0.borrow_mut().network_dropped = 2;
+        assert!(
+            pending
+                .retry(|_| Err(SendError::Transport(shared::ipc::QueueError::StaleEndpoint)))
+                .is_err()
+        );
+        assert!(pending.is_none());
+        bus.network_failed();
+        assert_eq!(next_record(&bus), record(0, UiEvent::Dropped { count: 39 }));
+        assert!(bus.network_frame().is_none());
+        assert_eq!(bus.0.borrow().network_loss_weight, 0);
+    }
+
+    #[test]
+    fn origin_routing_keeps_replay_serial_and_ipc_status_local() {
+        let bus = Bus::new(|| 0);
+        let processor = crate::usb::processor::Processor::new();
+        bus.connection(true);
+        bus.replay_serial(&processor);
+        assert!(bus.next().is_some());
+        assert!(bus.network_frame().is_none());
+        bus.accept_command(HostCommand::Stop).unwrap();
+        bus.accept_ipc_command(HostCommand::Status, &processor)
+            .unwrap();
+        bus.accept_command(HostCommand::Status).unwrap();
+        bus.accept_ipc_command(HostCommand::Start, &processor)
+            .unwrap();
+        assert!(bus.network_frame().is_some());
+        assert_eq!(bus.command(), Some(HostCommand::Stop));
+        assert_eq!(bus.command(), Some(HostCommand::Status));
+        assert_eq!(bus.command(), Some(HostCommand::Start));
+        assert!(bus.command().is_none());
+    }
+
+    #[test]
+    fn serial_abandonment_restores_marker_without_network_loss() {
+        let bus = Bus::new(|| 0);
+        bus.serial_failed(UiRecord {
+            timestamp_ms: 0,
+            event: UiEvent::Dropped { count: 17 },
+        });
+        bus.serial_failed(UiRecord {
+            timestamp_ms: 0,
+            event: raw(1),
+        });
+        assert_eq!(bus.next().unwrap().event, UiEvent::Dropped { count: 18 });
+        assert!(bus.network_frame().is_none());
     }
 
     #[test]
