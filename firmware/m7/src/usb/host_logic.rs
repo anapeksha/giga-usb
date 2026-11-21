@@ -18,7 +18,7 @@ fn raw_trace(message: &Message) -> bool {
 /// Preserve semantic/command ordering, sacrificing only the oldest raw trace.
 /// Rejections do not count as losses until the caller abandons publication.
 pub(super) fn queue_capture<const N: usize>(
-    pending: &mut heapless::Deque<Message, N>,
+    pending: &shared::ipc_delivery::Queue<Message, N>,
     message: Message,
     dropped: &mut u32,
 ) -> Result<(), ()> {
@@ -299,8 +299,61 @@ mod tests {
     }
 
     #[test]
+    fn boundary_backpressure_drains_burst_larger_than_both_old_and_new_queue() {
+        use crate::ipc_delivery::{Delivery, drain_deadline, should_drain};
+        use shared::{ipc::SendError, ipc_delivery::Pending};
+        let delivery = Delivery::new();
+        let mut pending = Pending::new();
+        let mut produced = 0;
+        let mut delivered = 0;
+        let mut dropped = 0;
+        let mut waiting_until = None;
+        let mut waited = false;
+        for now in (0..25_000).step_by(25) {
+            // Independent delivery task keeps retrying while the producer is
+            // throttled at a safe boundary. The peer recovers after saturation.
+            if pending.is_none() {
+                pending.set(delivery.captures.pop_front());
+            }
+            pending
+                .retry(|message| {
+                    if now < 2_500 {
+                        return Err(SendError::Full);
+                    }
+                    assert_eq!(message, &trace(delivered));
+                    delivered += 1;
+                    Ok(())
+                })
+                .unwrap();
+            if produced < 96 {
+                if delivery.captures.len() > 60 {
+                    waited = true;
+                    let until = *waiting_until.get_or_insert_with(|| drain_deadline(now, 25_000));
+                    assert!(
+                        should_drain(delivery.captures.len(), now, until),
+                        "consumer must recover within the bounded wait in this scenario"
+                    );
+                } else {
+                    waiting_until = None;
+                    queue_capture(&delivery.captures, trace(produced), &mut dropped).unwrap();
+                    produced += 1;
+                }
+            }
+            if delivered == 96 {
+                break;
+            }
+        }
+        assert!(waited);
+        assert_eq!(produced, 96);
+        assert_eq!(delivered, 96);
+        assert_eq!(dropped, 0);
+        assert!(delivery.captures.is_empty());
+        assert!(pending.is_none());
+    }
+
+    #[test]
     fn critical_evicts_oldest_trace_without_reordering_survivors() {
-        let mut queue = heapless::Deque::<Message, 5>::new();
+        let queue = shared::ipc_delivery::Queue::<Message, 5>::new();
         let mut dropped = 0;
         let first = captured(
             0,
@@ -337,7 +390,7 @@ mod tests {
             command.clone(),
             last.clone(),
         ] {
-            queue_capture(&mut queue, message, &mut dropped).unwrap();
+            queue_capture(&queue, message, &mut dropped).unwrap();
         }
         let incoming = captured(
             5,
@@ -346,7 +399,7 @@ mod tests {
                 configuration: 1,
             },
         );
-        queue_capture(&mut queue, incoming.clone(), &mut dropped).unwrap();
+        queue_capture(&queue, incoming.clone(), &mut dropped).unwrap();
         assert_eq!(dropped, 1);
         for expected in [first, packet, command, last, incoming] {
             assert_eq!(queue.pop_front(), Some(expected));
@@ -355,7 +408,7 @@ mod tests {
 
     #[test]
     fn raw_rejection_and_critical_retry_do_not_evict_semantics_or_count_retries() {
-        let mut queue = heapless::Deque::<Message, 2>::new();
+        let queue = shared::ipc_delivery::Queue::<Message, 2>::new();
         let mut dropped = u32::MAX - 1;
         let critical = captured(
             1,
@@ -364,11 +417,11 @@ mod tests {
                 configuration: 1,
             },
         );
-        queue_capture(&mut queue, trace(0), &mut dropped).unwrap();
-        queue_capture(&mut queue, critical.clone(), &mut dropped).unwrap();
+        queue_capture(&queue, trace(0), &mut dropped).unwrap();
+        queue_capture(&queue, critical.clone(), &mut dropped).unwrap();
         let rejected = trace(2);
         assert_eq!(
-            queue_capture(&mut queue, rejected.clone(), &mut dropped),
+            queue_capture(&queue, rejected.clone(), &mut dropped),
             Err(())
         );
         // Non-retrying callers count this rejected record once, not each attempt.
@@ -380,7 +433,7 @@ mod tests {
                 data: heapless::Vec::new(),
             },
         );
-        queue_capture(&mut queue, hid.clone(), &mut dropped).unwrap();
+        queue_capture(&queue, hid.clone(), &mut dropped).unwrap();
         assert_eq!(dropped, u32::MAX);
         let next = captured(
             4,
@@ -388,12 +441,9 @@ mod tests {
                 code: UsbError::Overflow,
             },
         );
-        assert_eq!(
-            queue_capture(&mut queue, next.clone(), &mut dropped),
-            Err(())
-        );
+        assert_eq!(queue_capture(&queue, next.clone(), &mut dropped), Err(()));
         assert_eq!(queue.pop_front(), Some(critical));
-        queue_capture(&mut queue, next.clone(), &mut dropped).unwrap();
+        queue_capture(&queue, next.clone(), &mut dropped).unwrap();
         assert_eq!(queue.pop_front(), Some(hid));
         assert_eq!(queue.pop_front(), Some(next));
         assert_eq!(dropped, u32::MAX);
@@ -401,10 +451,10 @@ mod tests {
 
     #[test]
     fn descriptor_burst_survives_trace_saturation_and_all_critical_backpressure() {
-        let mut queue = heapless::Deque::<Message, 32>::new();
+        let queue = shared::ipc_delivery::Queue::<Message, 32>::new();
         let mut dropped = 0;
         for i in 0..32 {
-            queue_capture(&mut queue, trace(i), &mut dropped).unwrap();
+            queue_capture(&queue, trace(i), &mut dropped).unwrap();
         }
         let mut expected = heapless::Vec::<Message, 34>::new();
         for interface in 0..4 {
@@ -443,9 +493,9 @@ mod tests {
             .unwrap();
         let mut delivered = heapless::Vec::<Message, 34>::new();
         for message in &expected {
-            if queue_capture(&mut queue, message.clone(), &mut dropped).is_err() {
+            if queue_capture(&queue, message.clone(), &mut dropped).is_err() {
                 delivered.push(queue.pop_front().unwrap()).unwrap();
-                queue_capture(&mut queue, message.clone(), &mut dropped).unwrap();
+                queue_capture(&queue, message.clone(), &mut dropped).unwrap();
             }
         }
         while let Some(message) = queue.pop_front() {

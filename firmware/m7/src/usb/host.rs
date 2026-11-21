@@ -21,8 +21,8 @@ use super::types::{
     CapturedEvent, DESCRIPTOR_CHUNK_SIZE, Direction, HostCommand, HostState, MAX_DESCRIPTOR_SIZE,
     TransferKind, TransferStage, UsbError, UsbEvent, UsbSpeed,
 };
+use crate::ipc_delivery::Delivery;
 use crate::network_bus::Bus;
-use shared::ipc::{Endpoint, SendError};
 use shared::protocol::{Event, Message};
 
 const ENABLE: u32 = 1 << 31;
@@ -32,15 +32,14 @@ const PORT_CHANGES: u32 = (1 << 1) | (1 << 3) | (1 << 5);
 
 /// Owns the HS controller and USB-A pins for its entire lifetime. USB-C/FS is
 /// never accessed. Do not construct another driver for these resources on M4.
-/// The IPC endpoint is moved here, not aliased with another M7 task.
+/// IPC delivery is independent; this task only accesses core-local channels.
 pub struct Host<'d> {
     _usb: Peri<'d, peripherals::USB_OTG_HS>,
     _dm: Peri<'d, peripherals::PB14>,
     _dp: Peri<'d, peripherals::PB15>,
     vbus: Output<'d>,
-    ipc: Endpoint,
+    delivery: &'d Delivery,
     network: Option<&'d Bus>,
-    pending: Deque<Message, 32>,
     storage_commands: Deque<HostCommand, 4>,
     enabled: bool,
     restart: bool,
@@ -73,16 +72,15 @@ impl<'d> Host<'d> {
         dm: Peri<'d, peripherals::PB14>,
         dp: Peri<'d, peripherals::PB15>,
         vbus: Peri<'d, peripherals::PA15>,
-        ipc: Endpoint,
+        delivery: &'d Delivery,
     ) -> Self {
         Self {
             _usb: usb,
             _dm: dm,
             _dp: dp,
             vbus: Output::new(vbus, Level::Low, Speed::Low),
-            ipc,
+            delivery,
             network: None,
-            pending: Deque::new(),
             storage_commands: Deque::new(),
             // USB-A VBUS stays off until an explicit browser Start command.
             enabled: false,
@@ -129,42 +127,28 @@ impl<'d> Host<'d> {
             && pac::USB_OTG_HS.gintsts().read().0 & (1 << 29) == 0
     }
 
-    fn flush(&mut self) {
-        for _ in 0..32 {
-            let Some(front) = self.pending.front() else {
-                break;
-            };
-            match self.ipc.try_send(front) {
-                Ok(()) => {
-                    self.pending.pop_front();
-                }
-                Err(SendError::Full) => break, // Keep the exact front frame.
-                Err(_) => {
-                    self.pending.pop_front();
-                    self.dropped = self.dropped.saturating_add(1);
-                }
-            }
-        }
+    fn collect_delivery_failures(&mut self) {
+        self.dropped = self.dropped.saturating_add(self.delivery.failed.replace(0));
     }
 
     fn emit(&mut self, event: UsbEvent) {
         if let Some(bus) = self.network {
             bus.observe_host(&event, Instant::now().as_millis());
         }
-        self.flush();
+        self.collect_delivery_failures();
         let record = CapturedEvent {
             timestamp_us: Instant::now().as_micros(),
             event,
         };
         match Message::encode(Event::Usb, &record) {
             Ok(message) => {
-                if queue_capture(&mut self.pending, message, &mut self.dropped).is_err() {
+                if queue_capture(&self.delivery.captures, message, &mut self.dropped).is_err() {
                     self.dropped = self.dropped.saturating_add(1);
                 }
             }
             _ => self.dropped = self.dropped.saturating_add(1),
         }
-        self.flush();
+        self.collect_delivery_failures();
     }
 
     async fn emit_reliable(&mut self, event: UsbEvent, deadline: Instant) -> Result<(), UsbError> {
@@ -177,9 +161,9 @@ impl<'d> Host<'d> {
             UsbError::Overflow
         })?;
         loop {
-            self.flush();
-            if queue_capture(&mut self.pending, message.clone(), &mut self.dropped).is_ok() {
-                self.flush();
+            self.collect_delivery_failures();
+            if queue_capture(&self.delivery.captures, message.clone(), &mut self.dropped).is_ok() {
+                self.collect_delivery_failures();
                 return Ok(());
             }
             if Instant::now() >= deadline {
@@ -276,17 +260,14 @@ impl<'d> Host<'d> {
     }
 
     pub(super) fn service(&mut self) {
-        self.flush();
-        if !self.pending.is_full()
-            && let Some(command) = self.network.and_then(|bus| bus.next_command())
-            && let Ok(message) = Message::encode(Event::Command, &command)
-        {
-            let _ = self.pending.push_back(message);
+        self.collect_delivery_failures();
+        if self.delivery.transport_errors.replace(0) != 0 {
+            self.error(UsbError::Transaction);
         }
         // Bound command processing even if the peer continuously refills IPC.
         for _ in 0..4 {
-            match self.ipc.try_receive() {
-                Ok(Some(message)) if message.event == Event::Command => {
+            match self.delivery.incoming.pop_front() {
+                Some(message) if message.event == Event::Command => {
                     match message.decode::<HostCommand>() {
                         Ok(HostCommand::Start) => {
                             if !self.enabled {
@@ -325,21 +306,15 @@ impl<'d> Host<'d> {
                         Err(_) => self.error(UsbError::Unsupported),
                     }
                 }
-                Ok(Some(message)) if message.event == Event::Ping => {
+                Some(message) if message.event == Event::Ping => {
                     let mut reply = message;
                     reply.event = Event::Pong;
-                    if self.pending.push_back(reply).is_err() {
-                        self.dropped = self.dropped.saturating_add(1);
+                    if queue_capture(&self.delivery.captures, reply, &mut self.dropped).is_err() {
+                        self.error(UsbError::Overflow);
                     }
                 }
-                Ok(Some(message)) if message.event == Event::Ui => {
-                    if let Some(bus) = self.network {
-                        bus.receive(&message);
-                    }
-                }
-                Ok(Some(_)) => {}
-                Ok(None) => break,
-                Err(_) => self.error(UsbError::Transaction),
+                Some(_) => {}
+                None => break,
             }
         }
         if Instant::now() >= self.status_at {
@@ -350,7 +325,7 @@ impl<'d> Host<'d> {
                 (self.dropped_trace)(self.dropped);
             }
         }
-        self.flush();
+        self.collect_delivery_failures();
     }
 
     pub(super) async fn pause(
@@ -661,6 +636,18 @@ impl<'d> Host<'d> {
         input: &mut [u8],
         deadline: Instant,
     ) -> Result<usize, UsbError> {
+        // Only throttle at a packet-safe boundary. Never extend the transfer's
+        // absolute deadline or wait indefinitely for a stopped M4. Reserve room
+        // for context/payload without delaying an active channel's RX draining.
+        let drain_until =
+            crate::ipc_delivery::drain_deadline(Instant::now().as_micros(), deadline.as_micros());
+        while crate::ipc_delivery::should_drain(
+            self.delivery.captures.len(),
+            Instant::now().as_micros(),
+            drain_until,
+        ) {
+            self.pause(100, true).await?;
+        }
         self.active_endpoint = packet.endpoint;
         self.attempt_started = Some(Instant::now());
         self.attempt_retries = 0;
