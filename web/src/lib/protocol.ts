@@ -501,7 +501,7 @@ export function applyRecord(s: ProtocolState, r: unknown): boolean {
       s.mouse = e;
       break;
     case 'error':
-      s.errors++;
+      s.warnings++;
       break;
     case 'dropped':
       s.queueDropped += e.count;

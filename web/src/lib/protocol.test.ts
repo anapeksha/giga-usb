@@ -237,6 +237,49 @@ test('protocol 6 raw setup golden and complete bounded packets', () => {
   }
 });
 
+test('generic IPC errors preserve USB counts, diagnostics and lifecycle without entering exports', () => {
+  const state = createState();
+  const host = (event: unknown) => applyRecord(state, record({ type: 'host', event }));
+  host({ lifecycle: { state: 'error', session_id: 1 } });
+  const diagnostic = {
+    code: 'timeout',
+    setup: [0, 0, 0, 0, 0, 0, 0, 0],
+    session_id: 1,
+    transfer_id: 2,
+    stage: 'data',
+    endpoint: 129,
+    elapsed_us: 1000,
+    retries: 2,
+    hcint: 1,
+    hcchar: 2,
+    hctsiz: 3,
+    hprt: 4,
+  };
+  assert.equal(host({ diagnostic }), true);
+  host({
+    status: { enabled: true, attached: true, address: 1, transfers: 5, errors: 1, dropped: 0 },
+  });
+  const before = structuredClone(state);
+  assert.equal(
+    applyRecord(state, record({ type: 'error', message: 'IPC transport failed' })),
+    true,
+  );
+  assert.deepEqual(state, {
+    ...before,
+    recordSequence: before.recordSequence + 1,
+    warnings: 1,
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(state.history)), before.history);
+  host({ error: { code: 'transaction' } });
+  assert.equal(state.errors, 2);
+  assert.deepEqual(state.diagnostic, diagnostic);
+  host({
+    status: { enabled: true, attached: true, address: 1, transfers: 5, errors: 1, dropped: 0 },
+  });
+  assert.equal(state.errors, 1);
+  assert.equal(state.warnings, 1);
+});
+
 test('history is a bounded 500-record ring and fresh sessions are empty', () => {
   const s = createState();
   for (let i = 0; i < 700; i++)

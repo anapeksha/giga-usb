@@ -148,7 +148,8 @@ test('non-USB floods update state without consuming USB history or export', () =
   assert.equal(s.lifecycle, 'ready');
   assert.equal(s.address, 1);
   assert.equal(s.transfers, 20);
-  assert.equal(s.errors, 3);
+  assert.equal(s.errors, 2);
+  assert.equal(s.warnings, 1);
   assert.equal(s.queueDropped, 4);
   assert.equal(s.storageError, 'No file');
   const exported = JSON.parse(JSON.stringify(s.history)) as ProtocolRecord[];
@@ -161,7 +162,7 @@ test('non-USB floods update state without consuming USB history or export', () =
 test('omitted non-USB records break context pairing across pages and JSON export', () => {
   const s = createState();
   applyRecord(s, record({ transfer_context: context }));
-  applyRecord(s, record('ready'));
+  applyRecord(s, { timestamp_ms: 1, event: { type: 'error', message: 'IPC transport failed' } });
   applyRecord(s, packet);
   assert.equal(groupTrace(s.history).length, 2);
   assert.equal(groupTrace(JSON.parse(JSON.stringify(s.history))).length, 2);

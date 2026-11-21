@@ -29,6 +29,7 @@ export function createHttpController() {
   const client = useQueryClient();
   let state = { ...createState(), transportDropped: 0 };
   let cursor = 0;
+  let lastGenericError: string | undefined;
   const listeners = new Set<(record: ProtocolRecord) => void>();
 
   let session: AbortController | null = null;
@@ -40,6 +41,7 @@ export function createHttpController() {
   const [paused, setPaused] = createSignal(false);
   const [notice, setNotice] = createSignal({ message: 'Connecting to GIGA…', error: false });
   const notify = (text: string, error = false, announce = true) => {
+    if (!error) lastGenericError = undefined;
     setNotice({ message: text, error });
     if (announce) {
       if (error) toast.error(text);
@@ -101,10 +103,18 @@ export function createHttpController() {
             );
           cursor = page.cursor;
           applyEventPage(state, page);
-          for (const record of page.records) for (const listener of listeners) listener(record);
+          for (const record of page.records) {
+            if (record.event.type === 'error') {
+              const text = record.event.message;
+              notify(text, true, text !== lastGenericError);
+              lastGenericError = text;
+            }
+            for (const listener of listeners) listener(record);
+          }
           if (!connected()) {
             setConnected(true);
-            toast.success('Connected.');
+            if (!page.records.some((record) => record.event.type === 'error'))
+              toast.success('Connected.');
             if (!notice().error) notify('Connected.', false, false);
           }
           if (refreshGuard(page.dropped)) refreshStatus(current);
@@ -193,6 +203,7 @@ export function createHttpController() {
     const current = new AbortController();
     session = current;
     cursor = 0;
+    lastGenericError = undefined;
     resetTrace();
     refreshGuard = createLossRefreshGuard();
     state = { ...createState(), transportDropped: 0 };
