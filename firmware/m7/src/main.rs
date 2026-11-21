@@ -11,16 +11,12 @@ use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
 use embassy_stm32::gpio::{Level, Output, Speed};
-use embassy_time::Timer;
+use embassy_time::{Instant, Timer};
 
 use m7::boot::{self, M4Boot};
 use m7::{network_bus::Bus, usb::host::Host};
 use panic_halt as _;
-use shared::{
-    ipc_delivery::Pending,
-    logging,
-    protocol::{Event, Message},
-};
+use shared::{ipc_delivery::Pending, logging, protocol::Event};
 use static_cell::StaticCell;
 
 #[embassy_executor::main]
@@ -84,7 +80,6 @@ async fn ipc_task(
 ) {
     let mut pending = Pending::new();
     let mut incoming = None;
-    let mut command_turn = true;
     loop {
         for _ in 0..8 {
             if let Some(message) = incoming.take() {
@@ -95,35 +90,19 @@ async fn ipc_task(
                     Ok(Some(message)) if message.event == Event::Ui => bus.receive(&message),
                     Ok(Some(message)) => incoming = delivery.incoming.push_back(message).err(),
                     Ok(None) => {}
-                    Err(_) => delivery
-                        .transport_errors
-                        .set(delivery.transport_errors.get().saturating_add(1)),
+                    Err(_) => delivery.note_transport_error(),
                 }
             }
-            if pending.is_none() {
-                if command_turn && let Some(command) = bus.next_command() {
-                    pending.set(Message::encode(Event::Command, &command).ok());
-                }
-                if pending.is_none() {
-                    pending.set(delivery.captures.pop_front());
-                    command_turn = true;
-                } else {
-                    command_turn = false;
-                }
-                if pending.is_none()
-                    && let Some(command) = bus.next_command()
-                {
-                    pending.set(Message::encode(Event::Command, &command).ok());
-                }
-            }
+            delivery.fill_pending(&mut pending);
             let event = pending.event();
             if pending.retry(|message| ipc.try_send(message)).is_err() {
+                if event == Some(Event::Command) {
+                    delivery.request_snapshot(true);
+                }
                 if event == Some(Event::Usb) {
                     delivery.failed.set(delivery.failed.get().saturating_add(1));
                 }
-                delivery
-                    .transport_errors
-                    .set(delivery.transport_errors.get().saturating_add(1));
+                delivery.note_transport_error();
             }
             // Cross-core slot readiness has no executor waker. A short bounded
             // poll replaces the former 1 ms per-frame bottleneck on M4.
@@ -136,6 +115,7 @@ async fn ipc_task(
                 Timer::after_micros(25).await;
             }
         }
+        delivery.report_transport_errors(bus, Instant::now().as_millis());
         embassy_futures::yield_now().await;
     }
 }

@@ -40,6 +40,7 @@ pub struct Host<'d> {
     vbus: Output<'d>,
     delivery: &'d Delivery,
     network: Option<&'d Bus>,
+    command_turn: crate::ipc_delivery::CommandTurn,
     storage_commands: Deque<HostCommand, 4>,
     enabled: bool,
     restart: bool,
@@ -81,6 +82,7 @@ impl<'d> Host<'d> {
             vbus: Output::new(vbus, Level::Low, Speed::Low),
             delivery,
             network: None,
+            command_turn: crate::ipc_delivery::CommandTurn::default(),
             storage_commands: Deque::new(),
             // USB-A VBUS stays off until an explicit browser Start command.
             enabled: false,
@@ -259,62 +261,74 @@ impl<'d> Host<'d> {
         self.emit(UsbEvent::Error { code });
     }
 
+    fn handle_command(&mut self, command: HostCommand, request_processor_snapshot: bool) {
+        match command {
+            HostCommand::Start => {
+                if !self.enabled {
+                    self.enabled = true;
+                    self.restart = true;
+                }
+            }
+            HostCommand::Stop => {
+                self.enabled = false;
+                self.lifecycle(HostState::Stopped);
+                self.restart = true;
+                // VBUS is removed immediately, even during a transfer wait.
+                self.vbus.set_low();
+            }
+            HostCommand::Reset => {
+                if self.enabled {
+                    self.restart = true;
+                }
+            }
+            HostCommand::Status => {
+                self.delivery.request_snapshot(request_processor_snapshot);
+                self.status();
+            }
+            command @ (HostCommand::StorageList | HostCommand::StorageRead { .. }) => {
+                if !self.enabled || !matches!(self.state, HostState::Ready | HostState::Enumerating)
+                {
+                    self.emit(UsbEvent::StorageError {
+                        message: super::storage::ascii(
+                            b"Start and enumerate a mass-storage device before requesting files",
+                        ),
+                    });
+                } else if self.storage_commands.push_back(command).is_err() {
+                    self.emit(UsbEvent::StorageError {
+                        message: super::storage::ascii(
+                            b"Storage command queue full; retry after the current response",
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
     pub(super) fn service(&mut self) {
         self.collect_delivery_failures();
-        if self.delivery.transport_errors.replace(0) != 0 {
-            self.error(UsbError::Transaction);
-        }
-        // Bound command processing even if the peer continuously refills IPC.
+
         for _ in 0..4 {
-            match self.delivery.incoming.pop_front() {
-                Some(message) if message.event == Event::Command => {
+            let Some(work) = self.command_turn.next(self.network, self.delivery) else {
+                break;
+            };
+            match work {
+                crate::ipc_delivery::Work::LocalCommand(command) => {
+                    self.handle_command(command, true)
+                }
+                crate::ipc_delivery::Work::Incoming(message) if message.event == Event::Command => {
                     match message.decode::<HostCommand>() {
-                        Ok(HostCommand::Start) => {
-                            if !self.enabled {
-                                self.enabled = true;
-                                self.restart = true;
-                            }
-                        }
-                        Ok(HostCommand::Stop) => {
-                            self.enabled = false;
-                            self.lifecycle(HostState::Stopped);
-                            self.restart = true;
-                            // VBUS is removed immediately, even during a transfer wait.
-                            self.vbus.set_low();
-                        }
-                        Ok(HostCommand::Reset) => {
-                            if self.enabled {
-                                self.restart = true;
-                            }
-                        }
-                        Ok(HostCommand::Status) => self.status(),
-                        Ok(
-                            command @ (HostCommand::StorageList | HostCommand::StorageRead { .. }),
-                        ) => {
-                            if !self.enabled
-                                || !matches!(self.state, HostState::Ready | HostState::Enumerating)
-                            {
-                                self.emit(UsbEvent::StorageError {
-                                    message: super::storage::ascii(b"Start and enumerate a mass-storage device before requesting files"),
-                                });
-                            } else if self.storage_commands.push_back(command).is_err() {
-                                self.emit(UsbEvent::StorageError {
-                                    message: super::storage::ascii(b"Storage command queue full; retry after the current response"),
-                                });
-                            }
-                        }
-                        Err(_) => self.error(UsbError::Unsupported),
+                        Ok(command) => self.handle_command(command, false),
+                        Err(_) => self.delivery.note_transport_error(),
                     }
                 }
-                Some(message) if message.event == Event::Ping => {
+                crate::ipc_delivery::Work::Incoming(message) if message.event == Event::Ping => {
                     let mut reply = message;
                     reply.event = Event::Pong;
                     if queue_capture(&self.delivery.captures, reply, &mut self.dropped).is_err() {
-                        self.error(UsbError::Overflow);
+                        self.dropped = self.dropped.saturating_add(1);
                     }
                 }
-                Some(_) => {}
-                None => break,
+                _ => {}
             }
         }
         if Instant::now() >= self.status_at {

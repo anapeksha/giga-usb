@@ -69,6 +69,31 @@ impl Bus {
     pub fn command(&self, command: HostCommand) -> bool {
         self.0.borrow_mut().commands.push_back(command).is_ok()
     }
+    /// Publish a bounded generic diagnostic without observing a USB host event.
+    pub fn publish_ipc_error(&self, total: u32, timestamp_ms: u64) -> bool {
+        let mut message = String::new();
+        let _ = write!(message, "IPC transport errors: {total} (cumulative)");
+        let record = shared::usb::types::UiRecord {
+            timestamp_ms,
+            event: shared::usb::types::UiEvent::Error { message },
+        };
+        let mut bytes = Vec::<u8, RECORD_BYTES>::new();
+        let mut buffer = [0; RECORD_BYTES];
+        let Ok(len) = serde_json_core::to_slice(&record, &mut buffer) else {
+            return false;
+        };
+        if bytes.extend_from_slice(&buffer[..len]).is_err() {
+            return false;
+        }
+        let mut state = self.0.borrow_mut();
+        state.cursor = state.cursor.wrapping_add(1);
+        let cursor = state.cursor;
+        if state.records.is_full() {
+            state.records.pop_front();
+        }
+        state.records.push_back((cursor, bytes)).is_ok()
+    }
+
     pub fn next_command(&self) -> Option<HostCommand> {
         self.0.borrow_mut().commands.pop_front()
     }
