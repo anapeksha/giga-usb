@@ -68,15 +68,16 @@ jobs:
           mkdir -p target/release-package target/release-assets
           cp target/thumbv7em-none-eabihf/release/m4 target/release-package/m4.elf
           cp target/thumbv7em-none-eabihf/release/m7 target/release-package/m7.elf
-          cp dist/index.html.gz target/release-package/
+          cp dist/index.html.gz dist/dashboard.qspi.bin dist/dashboard.qspi.bin.json target/release-package/
+          cp README.md AGENTS.md USB-IDS-LICENSE.txt target/release-package/
           cp LICENSE CHANGELOG.md target/release-package/
           {
             printf 'Tag: %s\nCommit: ' "$RELEASE_TAG"
             git rev-parse HEAD
             rustc --version
-            printf 'Features: defmt\nFlash M4 then M7; verify and system-reset. M7 overwrites the Arduino bootloader.\n'
+            printf 'Features: defmt\nExternal dashboard assets required; read README.md and AGENTS.md provisioning instructions before deployment.\nFlash M4 then M7; verify and system-reset. M7 overwrites the Arduino bootloader.\n'
           } > target/release-package/BUILD.txt
-          (cd target/release-package && sha256sum m4.elf m7.elf index.html.gz LICENSE CHANGELOG.md BUILD.txt > SHA256SUMS)
+          (cd target/release-package && sha256sum m4.elf m7.elf index.html.gz dashboard.qspi.bin dashboard.qspi.bin.json README.md AGENTS.md USB-IDS-LICENSE.txt LICENSE CHANGELOG.md BUILD.txt > SHA256SUMS)
           tar -czf "target/release-assets/$ASSET_NAME.tar.gz" -C target/release-package .
       - name: Install signing tool
         run: python -m pip install --disable-pip-version-check imgtool==2.5.0

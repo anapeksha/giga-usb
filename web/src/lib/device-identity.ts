@@ -1,8 +1,6 @@
 import type { InterfaceDescriptor, ProtocolState } from './protocol';
 
-// Offline usb.ids subset, fetched 2026-11-21 (file version 2026.06.26):
-// https://raw.githubusercontent.com/usbids/usbids/master/usb.ids
-// 046d Logitech, Inc.; c548 Logi Bolt Receiver. IDs are clues, not authentication.
+import { usbId } from './usb-ids';
 function classLabel(face: Pick<InterfaceDescriptor, 'class' | 'subclass' | 'protocol'>): string {
   switch (face.class) {
     case 3:
@@ -47,17 +45,17 @@ export function deviceIdentity(state: Pick<ProtocolState, 'device' | 'interfaces
   if (reported) {
     return { label: `Reported: ${reported}`, provenance: 'Storage inquiry vendor / product' };
   }
-  if (device.vendor_id === 0x046d && device.product_id === 0xc548) {
+  const identity = usbId(device.vendor_id, device.product_id);
+  if (identity.product) {
     return {
-      label: 'Likely Logitech Logi Bolt Receiver',
+      label: `Likely ${identity.vendor} ${identity.product}`,
       provenance: `Offline USB ID match · ${kind}`,
     };
   }
   return {
-    label: `Likely ${device.vendor_id === 0x046d ? 'Logitech ' : ''}${kind}`,
-    provenance:
-      device.vendor_id === 0x046d
-        ? 'Offline vendor ID match and descriptor classes; model unknown'
-        : 'Descriptor classes only; make and model unknown',
+    label: `Likely ${identity.vendor ? `${identity.vendor} ` : ''}${kind}`,
+    provenance: identity.vendor
+      ? 'Offline vendor ID match and descriptor classes; model unknown'
+      : 'Descriptor classes only; make and model unknown',
   };
 }

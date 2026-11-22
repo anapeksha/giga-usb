@@ -10,13 +10,12 @@ use m7::{
 use picoserve::{
     Config, Router, Server, Timeouts,
     extract::{Json, Query},
-    io::Write,
+    io::{Read, Write},
     response::{
-        Content, IntoResponse, Response, StatusCode,
-        fs::File,
+        Content, IntoResponse, Response, ResponseWriter, StatusCode,
         sse::{EventSource, EventStream, EventWriter},
     },
-    routing::{get, get_service, post},
+    routing::{PathRouterService, RequestHandlerService},
 };
 
 use shared::usb::types::CommandRequest;
@@ -28,13 +27,10 @@ struct PageBuffers {
 }
 
 impl PageBuffers {
+    // Keep synchronous page construction out of the stream's movable future.
+    #[inline(never)]
     fn prepare(&mut self, pages: &mut StreamPages, bus: &Bus) -> (bool, bool, bool) {
-        let next = pages.next(bus);
-        let events = next.events.is_some();
-        let trace = next.trace.is_some();
-        self.events = next.events.unwrap_or_default();
-        self.trace = next.trace.unwrap_or_default();
-        (events, trace, next.pending)
+        pages.next_into(bus, &mut self.events, &mut self.trace)
     }
 }
 
@@ -51,9 +47,15 @@ impl EventSource for Stream<'_> {
         mut writer: EventWriter<'_, W>,
     ) -> Result<(), W::Error> {
         if !self.subscriber.resumed {
-            let reset = picoserve::response::Json(Reset {
-                resume: self.subscriber.proof.as_deref(),
-            });
+            let mut bytes = [0; 256];
+            let length = serde_json_core::to_slice(
+                &Reset {
+                    resume: self.subscriber.proof.as_deref(),
+                },
+                &mut bytes,
+            )
+            .expect("bounded reset proof");
+            let reset = core::str::from_utf8(&bytes[..length]).expect("serialized reset JSON");
             match with_timeout(Duration::from_secs(5), writer.write_event("reset", reset)).await {
                 Ok(result) => result?,
                 Err(_) => return Ok(()),
@@ -110,9 +112,9 @@ impl EventSource for Stream<'_> {
     }
 }
 
-struct Events(String<4096>);
+struct Events<'a>(&'a str);
 
-impl Content for Events {
+impl Content for Events<'_> {
     fn content_type(&self) -> &'static str {
         "application/json"
     }
@@ -126,61 +128,105 @@ impl Content for Events {
     }
 }
 
+// One dispatch future avoids nesting a complete response future at every route.
+// Large page bodies remain borrowed from this worker's storage.
+struct HttpService<'a> {
+    bus: &'a Bus,
+    assets: &'static crate::assets::Assets,
+    buffers: &'a Mutex<NoopRawMutex, PageBuffers>,
+}
+
+impl PathRouterService for HttpService<'_> {
+    async fn call_path_router_service<R: Read, W: ResponseWriter<Error = R::Error>>(
+        &self,
+        state: &(),
+        _parameters: (),
+        path: picoserve::request::Path<'_>,
+        mut request: picoserve::request::Request<'_, R>,
+        response_writer: W,
+    ) -> Result<picoserve::ResponseSent, W::Error> {
+        let method = request.parts.method();
+        if path == "/" && method == "GET" {
+            return crate::assets::DashboardService(self.assets)
+                .call_request_handler_service(state, (), request, response_writer)
+                .await;
+        }
+        if path == "/api/events" && method == "GET" {
+            let Query(mut query) =
+                picoserve::from_request_parts!(state, request, response_writer, Query<StreamQuery>);
+            let response = self
+                .bus
+                .subscribe_client(
+                    query.client.as_deref(),
+                    query.attempt.as_deref(),
+                    query.resume.as_deref(),
+                )
+                .map(|subscriber| {
+                    query.reset_unless_resumed(subscriber.resumed);
+                    EventStream(Stream {
+                        bus: self.bus,
+                        subscriber,
+                        pages: StreamPages::new(query),
+                        buffers: self.buffers,
+                    })
+                })
+                .ok_or((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "event stream limit reached",
+                ));
+            return response
+                .write_to(request.body_connection.finalize().await?, response_writer)
+                .await;
+        }
+        if path == "/api/trace" && method == "GET" {
+            let Query(query) = picoserve::from_request_parts!(
+                state,
+                request,
+                response_writer,
+                Query<m7::trace_query::TraceQuery>
+            );
+            let mut buffers = self.buffers.lock().await;
+            self.bus.trace_into(&query, &mut buffers.trace);
+            return Response::ok(Events(buffers.trace.as_str()))
+                .with_header("Cache-Control", "no-store")
+                .write_to(request.body_connection.finalize().await?, response_writer)
+                .await;
+        }
+        if path == "/api/command" && method == "POST" {
+            let Json(request_body) =
+                picoserve::from_request!(state, request, response_writer, Json<CommandRequest>);
+            return command(self.bus, request_body)
+                .await
+                .write_to(request.body_connection.finalize().await?, response_writer)
+                .await;
+        }
+        let known =
+            path == "/" || path == "/api/events" || path == "/api/trace" || path == "/api/command";
+        let status = if known {
+            StatusCode::METHOD_NOT_ALLOWED
+        } else {
+            StatusCode::NOT_FOUND
+        };
+        Response::empty(status)
+            .write_to(request.body_connection.finalize().await?, response_writer)
+            .await
+    }
+}
+
 #[embassy_executor::task(pool_size = 3)]
-pub async fn serve(stack: Stack<'static>, bus: &'static Bus) {
+pub async fn serve(
+    stack: Stack<'static>,
+    bus: &'static Bus,
+    assets: &'static crate::assets::Assets,
+) {
     // Keep page storage outside picoserve's nested response futures.
     let buffers = Mutex::<NoopRawMutex, _>::new(PageBuffers::default());
     let buffers = &buffers;
-    let app =
-        Router::new()
-            .route(
-                "/",
-                get_service(File::with_content_type_and_headers(
-                    File::MIME_HTML,
-                    include_bytes!("../../../dist/index.html.gz"),
-                    &[("Content-Encoding", "gzip"), ("Cache-Control", "no-cache")],
-                )),
-            )
-            .route(
-                "/api/events",
-                get(move |Query(mut query): Query<StreamQuery>| {
-                    core::future::ready(
-                        bus.subscribe_client(
-                            query.client.as_deref(),
-                            query.attempt.as_deref(),
-                            query.resume.as_deref(),
-                        )
-                        .map(|subscriber| {
-                            query.reset_unless_resumed(subscriber.resumed);
-                            EventStream(Stream {
-                                bus,
-                                subscriber,
-                                pages: StreamPages::new(query),
-                                buffers,
-                            })
-                        })
-                        .ok_or((
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "event stream limit reached",
-                        )),
-                    )
-                }),
-            )
-            .route(
-                "/api/trace",
-                get(
-                    move |Query(query): Query<m7::trace_query::TraceQuery>| async move {
-                        Response::ok(Events(bus.trace(&query)))
-                            .with_header("Cache-Control", "no-store")
-                    },
-                ),
-            )
-            .route(
-                "/api/command",
-                post(move |Json(request): Json<CommandRequest>| async move {
-                    command(bus, request).await
-                }),
-            );
+    let app = Router::from_service(HttpService {
+        bus,
+        assets,
+        buffers,
+    });
     let config = Config::new(Timeouts {
         start_read_request: Duration::from_secs(5),
         read_request: Duration::from_secs(3),

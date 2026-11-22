@@ -27,6 +27,10 @@ handshakes, CRCs, bus timing and arbitrary external traffic are not captured.
   `firmware/m4/src/boot.rs` owns M4-specific boot adoption.
 - M7 owns USB_OTG_HS with its internal full-speed PHY, PB14/PB15, PA15 VBUS,
   SDMMC1, PB10, PC8–PC12/PD2, RGB LED PI12/PJ13/PE3 and TIM2.
+- M7 also exclusively owns external-flash GPIO SPI routing PD11/PD12/PE2/PF6/
+  PF10/PG6. Do not initialize QUADSPI concurrently. The current reader is read-only,
+  bounded and cooperative; do not substitute the BSP's unbounded blocking QSPI
+  transfers or wrap them in an ineffective async timeout.
 - M4 owns USB_OTG_FS, PA11/PA12 and TIM5. Never access one controller from both cores.
 - Embassy provides cooperative executors, timers, HAL support and USB device
   transport. `giga-r1` provides board Wi-Fi support, IPC queues and MPU setup.
@@ -45,11 +49,23 @@ ownership boundaries; shared has no core-selector features.
 `defmt` is the only optional application behavior. Logging is centralized in
 `shared::logging` and calls a no-op when disabled.
 
-Build the web bundle before M7; firmware uses `include_bytes!` on
-`dist/index.html.gz`. Production firmware uses release builds; debug firmware
-can exceed flash capacity. Preserve the single-file gzip build and serve it as
-HTML with `Content-Encoding: gzip`. Keep JSON endpoints uncompressed unless an
-explicit implementation and tests are added.
+Build the web bundle and separate `dist/dashboard.qspi.bin` container for deployment;
+M7 no longer embeds `dist/index.html.gz`. UI-only changes need external asset
+updates, not an M7 rebuild. See External dashboard provisioning below for the
+format, preparation tool and verification requirements. Do not assume external
+ranges are free. Future destructive updates require a verified full backup and
+allocation approval, or explicit informed authorization to discard existing data,
+and always require a validated part-specific loader. The user explicitly authorized
+erasing existing board flash data and reflashing for the current 2026-11-22
+operation; that one-time authorization supersedes its earlier preservation gate,
+not loader validation or verification, and does not authorize future erases.
+Installing M7 without valid assets serves a small 503 notice, not the dashboard.
+Production firmware uses release builds; debug firmware can exceed flash capacity.
+Preserve the single-file gzip build and serve it as HTML with
+`Content-Encoding: gzip`, no-cache and ETag/conditional 304 support. JSON/SSE stay
+uncompressed. The complete pinned offline USB registry lives in `web/src/lib`;
+its BSD notices are in root `USB-IDS-LICENSE.txt`. Preserve original source bytes,
+provenance, scoped lookup and license notices when updating. No runtime Internet registry fetch is permitted.
 
 ```sh
 (cd web && npm ci && npm run check)
@@ -73,6 +89,47 @@ limitation. Do not hide diagnostics or silently split the workspace. Keep only
 the cargo-embed server task; CodeLLDB attaches to its GDB endpoint. Cargo-embed
 is a GDB server, not a DAP server.
 
+### External dashboard provisioning
+
+- Allocation: external `0xF00000..0x1000000` on the measured 16-MiB JEDEC
+  `1f8901` device. This format is not proof that the range is free. Internal
+  firmware/RAM layouts are unchanged.
+- Container: 32-byte header, ASCII `GIGAUI01` at bytes 0–7, little-endian gzip
+  length at 8–11 (18 through 1 MiB minus 32), CRC-32/ISO-HDLC of the exact gzip
+  at 12–15, zero reserved bytes at 16–31. Payload follows, padded with `0xFF`
+  to sectors. CRC detects corruption, not authenticity; verify signed releases
+  with an independently trusted key.
+- M7 validates identity, bounds, reserved bytes, gzip magic and full CRC within a
+  five-second cooperative startup budget. The safe GPIO SPI reader uses mode 0,
+  `0x03` reads and `0x9F` identity only; IO2/IO3 stay high. Commands read at most
+  16 bytes and deselect before yielding. HTTP buffers 256 bytes and releases the
+  asset mutex before network writes. Do not initialize QUADSPI concurrently or
+  substitute unbounded BSP transfers. Real throughput remains hardware-unverified.
+- From `web/`, Node 24 offline preparation is
+  `node src/asset-image.ts prepare ../dist/index.html.gz ../target/dashboard-approved.bin /absolute/path/to/external-backup.bin RECORDED_SHA256`.
+  It checks a full 16-MiB backup's size/hash and touched sectors; append
+  `replace-dashboard` only for an existing valid dashboard. It rejects arbitrary
+  occupied data and creates output exclusively. It never accesses hardware or
+  proves backup freshness. One-time erase authorization does not change that
+  tool's checks; use only a separately validated destructive provisioning path.
+- Normally take two independent full external reads, compare bytes, record
+  JEDEC/SFDP and SHA-256, and keep two verified copies outside the repository.
+  Confirm allocation before preparing an image. Explicit permission to discard
+  data may waive preservation, but is not proof an erase/program path is safe.
+- Identify/release the probe owner. Use a reviewed loader for the actual part and
+  routing with bounded operations; never invent a Cube loader name. Routine
+  updates erase/program only the image's 4-KiB-aligned range at `0xF00000`, with
+  the header last. Compare fresh sectors against the backup before writing and
+  keep a restore plan. A wider erase needs explicit authorization. Do not change
+  option bytes or the development Mac's Wi-Fi.
+- Read back exact programmed bytes and SHA-256; for preservation updates compare
+  the entire external chip outside the changed range with the backup. Install
+  matching M4 then M7, verify and system-reset. Separately validate HTTP
+  length/gzip/ETag/304, downloaded bytes, browser rendering, missing/corrupt assets,
+  cancellation, slow/concurrent clients and USB/AP coexistence. Startup and
+  software tests do not establish these hardware results. Authorization alone
+  is not evidence that provisioning or any hardware check completed.
+
 ### GitHub CI and signed releases
 
 `.github/workflows/ci.yml` runs on pull requests and merge queues, without
@@ -87,6 +144,7 @@ that release's tag, and builds matching logging-enabled images and dashboard.
 The matching `## [<tag>]` entry in root `CHANGELOG.md` supplies the release notes;
 maintain an `Unreleased` section and add each tagged entry before releasing.
 Missing or empty entries fail the workflow. It packages both ELFs, the gzip UI,
+external QSPI container/metadata, provisioning safety guide, USB registry notices,
 changelog, checksums and build identity, then signs and
 verifies the archive with `imgtool` 2.5.0. `softprops/action-gh-release@v3` uploads
 only release assets, without replacing existing assets; no Actions artifacts are
@@ -581,11 +639,67 @@ The SSE images have not been flashed. On-board stream delivery, sustained USB/AP
 traffic, slow-client recovery and concurrent-client responsiveness remain NOT RUN.
 These checks do not resolve the initiating USB disconnect investigated above.
 
+### Offline registry provisioning — 2026-11-22
+
+With explicit one-time authorization to discard existing data, internal main
+flash was erased and matching logging-enabled release images flashed M4 then M7,
+verified and system-reset. External JEDEC `1f8901` commands were validated against
+Renesas AT25SF128A/AT25QF128A datasheet Rev Q. A bounded RAM-only GPIO loader erased
+the entire 16-MiB main array, verified every byte as `0xFF`, then programmed the
+393,216-byte dashboard container at `0xF00000`, header last. A second full-array
+comparison verified the exact image and `0xFF` everywhere else; host-side checks
+validated all 4,096 sector CRCs in both passes. No security/OTP or option bytes
+were changed. Internal readbacks before/after the final external operation match.
+
+Container SHA-256 is
+`1d9ae0a92e1ee51d8c2813d4783bef531fe34aefabbcd3c08385850e9c60ce7c`.
+Exact flashed ELFs and evidence are under `target/qspi-readonly/`; its
+`PROVISIONING-RESULT.md` records final results and superseded failed attempts.
+Startup retained the expected validated asset header. USB-C reported AP
+`192.168.4.1` without network error. Before the final external erase, the same
+images/assets enumerated receiver `046d:c548`, configured address 1 and completed
+41 transfers with zero USB errors and zero host-capture drops. After the final
+reset the host was left stopped/disabled/detached with zero counters.
+
+Software validation passed: 123 native Rust tests, 73 web unit tests, 55 Chromium
+fixture tests, formatting/lint/types, separate per-core release Clippy and builds
+with and without logging. On-board HTTP length/gzip/ETag/304, browser rendering,
+slow/concurrent clients, missing/corrupt assets and sustained USB/AP coexistence
+remain NOT RUN; a separate AP client is required. Do not treat successful startup
+or local browser fixtures as those results. This does not resolve the historical
+initiating USB disconnect or establish broad device compatibility.
+
+### HTTP stack correction — 2026-11-22
+
+After a dashboard failure report, live captures found both cores running, CDC
+responding and CFSR/HFSR clear, not a panic halt. The exact flashed M7 ELF did
+contain a 68,744-byte HTTP request-poll frame against only 54,156 bytes between
+static RAM and the initial stack pointer. This proves a stack-corruption defect,
+not that it caused the reported incident. Evidence is in `target/dashboard-hang/`.
+
+HTTP now uses one picoserve dispatch service, borrowed worker buffers and in-place
+SSE page construction. Three workers, two SSE admissions and eight sockets remain.
+Both release variants' largest identified frame is 18,304 bytes; the identified
+foreground SSE/page call chain totals 39,928 bytes. Logging-enabled static RAM now
+ends at `0x2403B534`, leaving 281,292 bytes to the initial SP without linker changes.
+This is not a formal worst-case bound for interrupts and indirect calls. Preserve
+compiled-stack review when changing nested HTTP futures; static task allocation
+and Clippy alone do not establish stack safety.
+
+All 125 native tests, formatting, M7 release Clippy and builds with/without logging
+passed. Matching logging images were flashed M4 then M7, verified and system-reset,
+without external erases or option changes. Asset validation and CDC AP startup
+passed, sampled CFSR/HFSR stayed clear; host was left stopped. Exact new ELFs and
+logs are in `target/dashboard-hang/FIXED-FLASH-RESULT.md`. The development Mac's
+unchanged route cannot reach the AP, so corrected on-board HTTP/browser behavior
+still needs confirmation from a separate client. Do not call the reported failure
+resolved from startup evidence alone.
+
 ### Routes
 
 | Route | Request | Response |
 | --- | --- | --- |
-| `GET /` | — | Embedded HTML, `Content-Encoding: gzip`, `Cache-Control: no-cache`, ETag |
+| `GET /` | Optional `If-None-Match` | QSPI-backed HTML, gzip, no-cache, ETag/304; 503 if assets invalid/missing |
 | `POST /api/command` | `{command}` | 202 queued, 503 queue full |
 | `GET /api/events` | Resume tokens, independent event/trace cursors and optional trace filters | SSE: `reset`, `events`, optional `trace`; comment heartbeats |
 | `GET /api/trace?after=0` | Cursor and optional trace filters | `{records:[{sequence,record}], cursor, dropped}` |

@@ -30,7 +30,7 @@ jobs:
         run: |
           npm ci
           npx playwright install --with-deps chromium
-      - name: Check dashboard
+      - name: Check dashboard, offline registry and external asset container
         working-directory: web
         run: npm run check:all
       - name: Install Rust toolchain

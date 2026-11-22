@@ -88,16 +88,16 @@ test('identity is an offline clue, resets with devices, and renders bounded stor
   await page.getByRole('button', { name: 'Device details', exact: true }).click();
   const region = page.getByRole('region', { name: 'USB device details', exact: true });
   await expect(
-    region.getByText('Likely Logitech Logi Bolt Receiver', { exact: true }),
+    region.getByText('Likely Logitech, Inc. Logi Bolt Receiver', { exact: true }),
   ).toBeVisible();
   await expect(region.getByText(/Offline USB ID match/)).toBeVisible();
   api.emit({ type: 'host', event: { lifecycle: { state: 'enumerating', session_id: 2 } } });
-  await expect(region.getByText('Likely Logitech Logi Bolt Receiver', { exact: true })).toHaveCount(
-    0,
-  );
+  await expect(
+    region.getByText('Likely Logitech, Inc. Logi Bolt Receiver', { exact: true }),
+  ).toHaveCount(0);
   api.emit({
     type: 'device',
-    descriptor: { ...descriptor, vendor_id: 0x1209, product_id: 0xabcd, class: 8 },
+    descriptor: { ...descriptor, vendor_id: 0xffff, product_id: 0xabcd, class: 8 },
   });
   await expect(region.getByText('Likely USB storage', { exact: true })).toBeVisible();
   await expect(
@@ -135,4 +135,39 @@ test('identity is an offline clue, resets with devices, and renders bounded stor
     region.getByText(`Reported: ${'V'.repeat(8)} ${'P'.repeat(16)}`, { exact: true }),
   ).toBeVisible();
   await expect(region.getByText('Likely USB storage', { exact: true })).toHaveCount(0);
+});
+
+test('complete registry identifies unrelated manufacturers without Internet access', async ({
+  page,
+  api,
+  appURL,
+}) => {
+  const origins = new Set<string>();
+  page.on('request', (request) => origins.add(new URL(request.url()).origin));
+  api.emit({
+    type: 'device',
+    descriptor: { ...descriptor, vendor_id: 0x05ac, product_id: 0x0201 },
+  });
+  await page.goto(appURL);
+  await page.getByRole('button', { name: 'Device details', exact: true }).click();
+  const region = page.getByRole('region', { name: 'USB device details', exact: true });
+  await expect(
+    region.getByText('Likely Apple, Inc. USB Keyboard [Alps or Logitech, M2452]', { exact: true }),
+  ).toBeVisible();
+  api.emit({
+    type: 'device',
+    descriptor: { ...descriptor, vendor_id: 0x0781, product_id: 0x0001 },
+  });
+  await expect(
+    region.getByText('Likely SanDisk Corp. SDDR-05a ImageMate CompactFlash Reader', {
+      exact: true,
+    }),
+  ).toBeVisible();
+  api.emit({
+    type: 'device',
+    descriptor: { ...descriptor, vendor_id: 0x05ac, product_id: 0xc548 },
+  });
+  await expect(region.getByText('Likely Apple, Inc. USB device', { exact: true })).toBeVisible();
+  await expect(page.getByText('USB ID database notices', { exact: true })).toBeVisible();
+  expect([...origins]).toEqual([new URL(appURL).origin]);
 });

@@ -41,7 +41,12 @@ pub struct Pins {
 
 /// Run the open GigaUSB AP, DHCP and three HTTP workers indefinitely.
 #[embassy_executor::task]
-pub async fn run(pins: Pins, bus: &'static Bus, spawner: Spawner) {
+pub async fn run(
+    pins: Pins,
+    bus: &'static Bus,
+    spawner: Spawner,
+    assets: &'static crate::assets::Assets,
+) {
     let mut sdmmc = Sdmmc::new_4bit(
         pins.sdmmc,
         Irqs,
@@ -106,7 +111,7 @@ pub async fn run(pins: Pins, bus: &'static Bus, spawner: Spawner) {
         );
         let _ = bus.command(HostCommand::Status);
         for _ in 0..3 {
-            spawner.spawn(http::serve(stack, bus).unwrap());
+            spawner.spawn(http::serve(stack, bus, assets).unwrap());
         }
         join(net.run(), dhcp(stack)).await;
     };

@@ -244,6 +244,13 @@ impl Bus {
     }
     /// Filter retained history without changing event delivery or counting exclusions as loss.
     pub fn trace(&self, query: &crate::trace_query::TraceQuery) -> String<4096> {
+        let mut out = String::new();
+        self.trace_into(query, &mut out);
+        out
+    }
+
+    pub fn trace_into(&self, query: &crate::trace_query::TraceQuery, out: &mut String<4096>) {
+        out.clear();
         let s = self.0.borrow();
         let age = s.cursor.wrapping_sub(query.after);
         let restart = age > i32::MAX as u32;
@@ -252,7 +259,6 @@ impl Bus {
         } else {
             age.saturating_sub(s.records.len() as u32)
         };
-        let mut out = String::new();
         let _ = out.push_str("{\"records\":[");
         let mut count = 0;
         let mut cursor = if restart || missed != 0 {
@@ -316,7 +322,6 @@ impl Bus {
             cursor,
             missed.saturating_add(s.dropped)
         );
-        out
     }
 
     /// At most three records per page; callers continue from the returned cursor.
@@ -324,8 +329,14 @@ impl Bus {
     /// assembly overflows. It is not a per-page delta or a host/M4 capture-drop counter;
     /// do not repeatedly sum it across polls.
     pub fn events(&self, after: u32) -> String<4096> {
-        let s = self.0.borrow();
         let mut out = String::new();
+        self.events_into(after, &mut out);
+        out
+    }
+
+    pub fn events_into(&self, after: u32, out: &mut String<4096>) {
+        out.clear();
+        let s = self.0.borrow();
         let _ = out.push_str("{\"records\":[");
         let mut cursor = after;
         let mut count = 0;
@@ -363,7 +374,6 @@ impl Bus {
             cursor,
             missed.saturating_add(s.dropped)
         );
-        out
     }
 }
 

@@ -1,4 +1,5 @@
 import { For, Show, Suspense } from 'solid-js';
+import usbIdsLicense from '../../USB-IDS-LICENSE.txt?raw';
 import {
   Accordion,
   AccordionItem,
@@ -331,6 +332,12 @@ export default function App() {
           exportTrace={http.exportTrace}
         />
       </Suspense>
+      <details class="mt-6 text-sm text-muted-foreground">
+        <summary class="cursor-pointer rounded focus-visible:outline-2">
+          USB ID database notices
+        </summary>
+        <pre class="mt-2 max-h-64 overflow-auto whitespace-pre-wrap">{usbIdsLicense}</pre>
+      </details>
     </main>
   );
 }

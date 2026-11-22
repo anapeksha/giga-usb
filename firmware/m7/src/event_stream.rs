@@ -78,28 +78,41 @@ impl StreamPages {
     }
 
     pub fn next(&mut self, bus: &crate::network_bus::Bus) -> Pages {
-        let events = bus.events(self.after);
-        let next = position(&events);
+        let mut events = String::new();
+        let mut trace = String::new();
+        let (send_events, send_trace, pending) = self.next_into(bus, &mut events, &mut trace);
+        Pages {
+            events: send_events.then_some(events),
+            trace: send_trace.then_some(trace),
+            pending,
+        }
+    }
+
+    /// Fill worker-owned storage without moving page arrays through async futures.
+    pub fn next_into(
+        &mut self,
+        bus: &crate::network_bus::Bus,
+        events: &mut String<4096>,
+        trace: &mut String<4096>,
+    ) -> (bool, bool, bool) {
+        bus.events_into(self.after, events);
+        let next = position(events);
         let mut pending = next.cursor != self.after;
         let send_events = self.initial || pending || next.dropped != self.event_loss;
         self.after = next.cursor;
         self.event_loss = next.dropped;
-        let trace = self.trace.as_mut().and_then(|query| {
-            let page = bus.trace(query);
-            let next = position(&page);
+        let send_trace = self.trace.as_mut().is_some_and(|query| {
+            bus.trace_into(query, trace);
+            let next = position(trace);
             let progressed = next.cursor != query.after;
             let send = self.initial || progressed || next.dropped != self.trace_loss;
             pending |= progressed;
             query.after = next.cursor;
             self.trace_loss = next.dropped;
-            send.then_some(page)
+            send
         });
         self.initial = false;
-        Pages {
-            events: send_events.then_some(events),
-            trace,
-            pending,
-        }
+        (send_events, send_trace, pending)
     }
 }
 
@@ -119,6 +132,69 @@ pub fn position(page: &str) -> PagePosition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_buffers_are_reused_without_stale_pages_or_cursor_changes() {
+        use crate::trace_query::tests::{send, transfer};
+        use shared::usb::types::UiEvent;
+        let bus = crate::network_bus::Bus::new();
+        for _ in 0..7 {
+            send(
+                &bus,
+                UiEvent::Host {
+                    event: transfer(128),
+                },
+            );
+        }
+        let query = || StreamQuery {
+            trace: true,
+            ..Default::default()
+        };
+        let mut owned = StreamPages::new(query());
+        let mut borrowed = StreamPages::new(query());
+        let mut events = String::try_from("stale event bytes").unwrap();
+        let mut trace = String::try_from("stale trace bytes").unwrap();
+        for _ in 0..5 {
+            let expected = owned.next(&bus);
+            let (send_events, send_trace, pending) =
+                borrowed.next_into(&bus, &mut events, &mut trace);
+            assert_eq!(send_events, expected.events.is_some());
+            assert_eq!(send_trace, expected.trace.is_some());
+            assert_eq!(pending, expected.pending);
+            if let Some(expected) = expected.events {
+                assert_eq!(events, expected);
+            }
+            if let Some(expected) = expected.trace {
+                assert_eq!(trace, expected);
+            }
+            assert!(!events.contains("stale"));
+            assert!(!trace.contains("stale"));
+        }
+        bus.events_into(0, &mut events);
+        bus.events_into(7, &mut events);
+        assert_eq!(events, bus.events(7));
+        let query = TraceQuery {
+            after: 7,
+            ..Default::default()
+        };
+        bus.trace_into(&query, &mut trace);
+        assert_eq!(trace, bus.trace(&query));
+    }
+
+    #[test]
+    fn reset_proof_worst_case_escaping_fits_stream_buffer() {
+        let proof = "\u{0001}".repeat(32);
+        let mut bytes = [0; 256];
+        let len = serde_json_core::to_slice(
+            &Reset {
+                resume: Some(&proof),
+            },
+            &mut bytes,
+        )
+        .unwrap();
+        assert!(len <= bytes.len());
+        assert!(core::str::from_utf8(&bytes[..len]).is_ok());
+    }
 
     #[test]
     fn defaults_and_independent_trace_cursor() {

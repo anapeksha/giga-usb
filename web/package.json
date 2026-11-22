@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
+    "build": "vite build && node src/asset-image.ts build ../dist/index.html.gz ../dist/dashboard.qspi.bin",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "lint": "eslint . --max-warnings 0",

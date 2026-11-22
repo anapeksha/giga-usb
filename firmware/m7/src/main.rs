@@ -3,6 +3,7 @@
 #![recursion_limit = "256"]
 #![forbid(unsafe_code)]
 
+mod assets;
 mod http;
 mod network;
 mod status_led;
@@ -11,7 +12,7 @@ mod status_led;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
-use embassy_stm32::gpio::{Level, Output, Speed};
+use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};
 use embassy_time::{Instant, Timer};
 
 use m7::boot::{self, M4Boot};
@@ -47,6 +48,26 @@ async fn main(spawner: Spawner) {
         )
         .unwrap(),
     );
+    let mut flash = assets::Flash {
+        clock: Output::new(p.PF10, Level::Low, Speed::Low),
+        select: Output::new(p.PG6, Level::High, Speed::Low),
+        mosi: Output::new(p.PD11, Level::Low, Speed::Low),
+        miso: Input::new(p.PD12, Pull::None),
+        hold: Output::new(p.PF6, Level::High, Speed::Low),
+        protect: Output::new(p.PE2, Level::High, Speed::Low),
+    };
+    let header = embassy_time::with_timeout(embassy_time::Duration::from_secs(5), flash.validate())
+        .await
+        .ok()
+        .flatten();
+    if header.is_none() {
+        logging::warn!("QSPI dashboard missing or invalid; HTTP recovery notice only");
+    }
+    static ASSETS: StaticCell<assets::Assets> = StaticCell::new();
+    let assets = ASSETS.init(assets::Assets {
+        flash: embassy_sync::mutex::Mutex::new(flash),
+        header,
+    });
     spawner.spawn(
         network::run(
             network::Pins {
@@ -61,6 +82,7 @@ async fn main(spawner: Spawner) {
             },
             bus,
             spawner,
+            assets,
         )
         .unwrap(),
     );

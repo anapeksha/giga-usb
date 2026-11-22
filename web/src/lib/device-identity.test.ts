@@ -28,16 +28,19 @@ const face = (classCode: number, protocol = 0, subclass = 0): InterfaceDescripto
   endpoints: 1,
 });
 
-test('only the verified VID/PID pair gets a model guess', () => {
-  assert.equal(deviceIdentity(state(0x046d, 0xc548))?.label, 'Likely Logitech Logi Bolt Receiver');
+test('model guesses require an exact vendor-scoped product match', () => {
+  assert.equal(
+    deviceIdentity(state(0x046d, 0xc548))?.label,
+    'Likely Logitech, Inc. Logi Bolt Receiver',
+  );
   assert.equal(deviceIdentity(state(0xffff, 0xc548))?.label, 'Likely USB device');
   const unknownProduct = deviceIdentity(state(0x046d, 0x1234));
-  assert.equal(unknownProduct?.label, 'Likely Logitech USB device');
+  assert.equal(unknownProduct?.label, 'Likely Logitech, Inc. USB device');
   assert.match(unknownProduct!.provenance, /model unknown/);
 });
 
 test('unknown IDs use device or interface classes without claiming a receiver', () => {
-  assert.equal(deviceIdentity(state(1, 2, 8))?.label, 'Likely USB storage');
+  assert.equal(deviceIdentity(state(0xffff, 2, 8))?.label, 'Likely USB storage');
   const current = state();
   current.interfaces = [face(3, 1, 1), face(3, 2, 1), face(3, 2, 1), face(8)];
   assert.equal(deviceIdentity(current)?.label, 'Likely HID keyboard / HID mouse / USB storage');

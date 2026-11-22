@@ -4,6 +4,7 @@
 pub mod ap_driver;
 #[cfg(target_os = "none")]
 pub mod boot;
+pub mod dashboard;
 pub mod event_stream;
 pub mod ipc_delivery;
 pub mod network_bus;
