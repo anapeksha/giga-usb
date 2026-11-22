@@ -4,7 +4,7 @@ Release notes are maintained here. Each release uses its matching tagged entry.
 
 ## [Unreleased]
 
-## [v0.1.0] - 2026-11-21
+## [v0.1.0] - 2026-11-22
 
 Initial experimental release of GigaUSB for the Arduino GIGA R1 WiFi.
 
