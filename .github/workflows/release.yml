@@ -28,15 +28,29 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@v7
         with:
-          node-version: '24'
+          node-version: "24"
           cache: npm
           cache-dependency-path: web/package-lock.json
       - uses: actions/setup-python@v7
         with:
-          python-version: '3.13'
-      - name: Name release assets
+          python-version: "3.13"
+      - name: Prepare release metadata
         run: |
-          node -e 'const fs = require("node:fs"); const tag = process.env.RELEASE_TAG.replace(/[^A-Za-z0-9._-]/g, "-"); fs.appendFileSync(process.env.GITHUB_ENV, `ASSET_NAME=giga-usb-${tag}\n`);'
+          node <<'NODE'
+          const fs = require('node:fs');
+          const tag = process.env.RELEASE_TAG;
+          const safeTag = tag.replace(/[^A-Za-z0-9._-]/g, '-');
+          fs.appendFileSync(process.env.GITHUB_ENV, `ASSET_NAME=giga-usb-${safeTag}\n`);
+          const heading = `## [${tag}]`;
+          const lines = fs.readFileSync('CHANGELOG.md', 'utf8').split('\n');
+          const start = lines.findIndex(line => line === heading || line.startsWith(`${heading} - `));
+          if (start < 0) throw new Error(`Missing CHANGELOG.md entry for ${tag}`);
+          const next = lines.findIndex((line, index) => index > start && line.startsWith('## '));
+          const notes = lines.slice(start + 1, next < 0 ? undefined : next).join('\n').trim();
+          if (!notes) throw new Error(`Empty CHANGELOG.md entry for ${tag}`);
+          fs.mkdirSync('target', { recursive: true });
+          fs.writeFileSync('target/release-notes.md', `${notes}\n`);
+          NODE
       - name: Build dashboard
         working-directory: web
         run: npm ci && npm run check
@@ -55,14 +69,14 @@ jobs:
           cp target/thumbv7em-none-eabihf/release/m4 target/release-package/m4.elf
           cp target/thumbv7em-none-eabihf/release/m7 target/release-package/m7.elf
           cp dist/index.html.gz target/release-package/
-          cp LICENSE target/release-package/
+          cp LICENSE CHANGELOG.md target/release-package/
           {
             printf 'Tag: %s\nCommit: ' "$RELEASE_TAG"
             git rev-parse HEAD
             rustc --version
             printf 'Features: defmt\nFlash M4 then M7; verify and system-reset. M7 overwrites the Arduino bootloader.\n'
           } > target/release-package/BUILD.txt
-          (cd target/release-package && sha256sum m4.elf m7.elf index.html.gz LICENSE BUILD.txt > SHA256SUMS)
+          (cd target/release-package && sha256sum m4.elf m7.elf index.html.gz LICENSE CHANGELOG.md BUILD.txt > SHA256SUMS)
           tar -czf "target/release-assets/$ASSET_NAME.tar.gz" -C target/release-package .
       - name: Install signing tool
         run: python -m pip install --disable-pip-version-check imgtool==2.5.0
@@ -92,6 +106,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.event.release.tag_name }}
+          body_path: target/release-notes.md
           prerelease: ${{ github.event.release.prerelease }}
           overwrite_files: false
           fail_on_unmatched_files: true

@@ -84,7 +84,10 @@ enable repository rulesets. These checks are software evidence, not board tests.
 
 `.github/workflows/release.yml` runs on GitHub Release `created`, checks out
 that release's tag, and builds matching logging-enabled images and dashboard.
-It packages both ELFs, the gzip UI, checksums and build identity, then signs and
+The matching `## [<tag>]` entry in root `CHANGELOG.md` supplies the release notes;
+maintain an `Unreleased` section and add each tagged entry before releasing.
+Missing or empty entries fail the workflow. It packages both ELFs, the gzip UI,
+changelog, checksums and build identity, then signs and
 verifies the archive with `imgtool` 2.5.0. `softprops/action-gh-release@v3` uploads
 only release assets, without replacing existing assets; no Actions artifacts are
 uploaded. Actions use major-version references. Tags are not semver-validated:
@@ -99,12 +102,13 @@ published transitions must be covered. This post-creation asset upload is not
 compatible with immutable releases: those require a draft-first upload workflow
 before publication.
 
-Before releasing, create the **release** GitHub environment with required
-reviewers and deployment restrictions allowing only trusted release tags. Protect
-release-tag creation/update/deletion with a repository tag ruleset. A release trigger
-alone does not prove the commit passed PR checks: release only reviewed commits
-from the protected default branch. Restrict who can modify workflows and approve
-releases. Add these environment settings:
+The workflow uses repository secrets, without a GitHub environment. Protect
+release-tag creation/update/deletion and the default branch with repository rulesets
+where the GitHub plan supports them. A release trigger alone does not prove the
+commit passed PR checks: release reviewed commits and restrict who can modify
+workflows or create releases. For approval gates, explicitly add a protected
+GitHub environment to the workflow; repository secrets alone do not enforce them.
+Add these repository secrets:
 
 - Secret **FIRMWARE_SIGNING_KEY**: the complete, unencrypted Ed25519 private PEM.
 - Secret **FIRMWARE_SIGNING_PUBLIC_KEY**: its public PEM, maintained independently
@@ -121,13 +125,13 @@ signing-tools/bin/imgtool keygen --type ed25519 --key signing-private.pem
 signing-tools/bin/imgtool getpub --key signing-private.pem --encoding pem --output signing-public.pem
 ```
 
-In GitHub Settings → Environments → release → Environment secrets, add each
-complete PEM file under the secret names above. Alternatively, from that trusted
+In GitHub Settings → Secrets and variables → Actions → Repository secrets, add
+each complete PEM file under the secret names above. Alternatively, from that trusted
 machine with GitHub CLI authenticated:
 
 ```sh
-gh secret set FIRMWARE_SIGNING_KEY --env release --repo anapeksha/giga-usb < signing-private.pem
-gh secret set FIRMWARE_SIGNING_PUBLIC_KEY --env release --repo anapeksha/giga-usb < signing-public.pem
+gh secret set FIRMWARE_SIGNING_KEY --repo anapeksha/giga-usb < signing-private.pem
+gh secret set FIRMWARE_SIGNING_PUBLIC_KEY --repo anapeksha/giga-usb < signing-public.pem
 ```
 
 Both PEMs are stored in Secrets; only the public PEM is intentionally included
@@ -135,7 +139,7 @@ in release assets. Never upload the private PEM as a release asset or issue.
 Publish the public-key fingerprint through an independently trusted channel;
 trusting a public key downloaded alongside an untrusted release is insufficient.
 The workflow removes its temporary private-key file on exit. Do not enable shell
-tracing for signing steps or expose the release environment to PR jobs.
+tracing for signing steps or expose signing secrets to PR jobs.
 
 **This is distribution signing, not secure boot.** The board has no MCUboot
 verifier, and its vector tables must stay at the existing flash bases. Arduino
