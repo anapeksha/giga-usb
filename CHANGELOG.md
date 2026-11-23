@@ -7,6 +7,31 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [v0.1.0-rc2] - 2026-11-22
+
+Second release candidate. This supersedes rc1 for distribution without logging;
+USB functionality, dashboard assets and known hardware-validation limits are
+unchanged. It remains experimental firmware, not a stable release.
+
+### Changed
+
+- Release archives now contain logging-disabled firmware, built without `defmt`.
+  Packaging rejects ELFs containing defmt metadata or an RTT control block;
+  development CI continues checking both logging modes.
+
+### Installation and verification
+
+- Verify `giga-usb-v0.1.0-rc2.signed.bin` with an independently trusted public key
+  and compare its signed payload with `giga-usb-v0.1.0-rc2.tar.gz` before extraction.
+  Check the extracted checksums and confirm `BUILD.txt` reports `defmt disabled`.
+- **Never flash the signed container.** Install the extracted `m4.elf`, then
+  `m7.elf`, verify both and system-reset. The matching external dashboard assets
+  are required; an identical, already verified container need not be rewritten.
+- Routine installation does not require changing option bytes, readout or write
+  protection, OTP or security areas. Distribution signing is not secure boot.
+- On-board HTTP/browser confirmation, sustained USB/AP traffic and real-media
+  storage validation remain outstanding, as described in rc1 below.
+
 ## [v0.1.0-rc1] - 2026-11-22
 
 First release candidate for the Arduino GIGA R1 WiFi. This is experimental
@@ -88,5 +113,6 @@ limited; review the known limitations and installation requirements below.
   require mass erase or option-byte changes. Preserve existing external data
   unless its owner explicitly authorizes discarding it.
 
-[Unreleased]: https://github.com/anapeksha/giga-usb/compare/v0.1.0-rc1...HEAD
+[Unreleased]: https://github.com/anapeksha/giga-usb/compare/v0.1.0-rc2...HEAD
+[v0.1.0-rc2]: https://github.com/anapeksha/giga-usb/compare/v0.1.0-rc1...v0.1.0-rc2
 [v0.1.0-rc1]: https://github.com/anapeksha/giga-usb/releases/tag/v0.1.0-rc1

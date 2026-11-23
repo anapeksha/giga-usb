@@ -140,7 +140,12 @@ and builds with and without `defmt`. In the default-branch ruleset, require the
 enable repository rulesets. These checks are software evidence, not board tests.
 
 `.github/workflows/release.yml` runs on GitHub Release `created`, checks out
-that release's tag, and builds matching logging-enabled images and dashboard.
+that release's tag, and builds matching logging-disabled images and dashboard.
+Release builds explicitly use `--no-default-features`, omit `defmt`, and reject
+ELFs containing a `.defmt` section or `_SEGGER_RTT` symbol. CI still checks both
+logging modes. Distribution verification must precede installing the extracted
+ELFs and external assets; never flash the signed container. Routine installation
+must not change option bytes, RDP, protection settings, OTP or security areas.
 The matching `## [<tag>]` entry in root `CHANGELOG.md` supplies the release notes;
 maintain an `Unreleased` section and add each tagged entry before releasing.
 Missing or empty entries fail the workflow. It packages both ELFs, the gzip UI,

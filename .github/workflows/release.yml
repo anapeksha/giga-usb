@@ -58,10 +58,23 @@ jobs:
         run: |
           rustup show active-toolchain
           cargo fmt --all -- --check
-          cargo clippy -p m4 --release --features defmt --locked -- -D warnings
-          cargo clippy -p m7 --release --features defmt --locked -- -D warnings
-          cargo build -p m4 --release --features defmt --locked
-          cargo build -p m7 --release --features defmt --locked
+          cargo clippy -p m4 --release --no-default-features --locked -- -D warnings
+          cargo clippy -p m7 --release --no-default-features --locked -- -D warnings
+          cargo build -p m4 --release --no-default-features --locked
+          cargo build -p m7 --release --no-default-features --locked
+      - name: Verify release logging is disabled
+        shell: bash
+        run: |
+          for core in m4 m7; do
+            image="target/thumbv7em-none-eabihf/release/$core"
+            readelf --sections --wide "$image" > "target/$core-release-sections.txt"
+            readelf --symbols --wide "$image" > "target/$core-release-symbols.txt"
+            if grep -Eq '[[:space:]]\.defmt([[:space:].]|$)' "target/$core-release-sections.txt" ||
+               grep -q '_SEGGER_RTT' "target/$core-release-symbols.txt"; then
+              echo "Unexpected defmt/RTT instrumentation in $core release image." >&2
+              exit 1
+            fi
+          done
       - name: Package release
         shell: bash
         run: |
@@ -75,7 +88,7 @@ jobs:
             printf 'Tag: %s\nCommit: ' "$RELEASE_TAG"
             git rev-parse HEAD
             rustc --version
-            printf 'Features: defmt\nExternal dashboard assets required; read README.md and AGENTS.md provisioning instructions before deployment.\nFlash M4 then M7; verify and system-reset. M7 overwrites the Arduino bootloader.\n'
+            printf 'Features: none (defmt disabled)\nExternal dashboard assets required; read README.md and AGENTS.md provisioning instructions before deployment.\nFlash M4 then M7; verify and system-reset. M7 overwrites the Arduino bootloader.\n'
           } > target/release-package/BUILD.txt
           (cd target/release-package && sha256sum m4.elf m7.elf index.html.gz dashboard.qspi.bin dashboard.qspi.bin.json README.md AGENTS.md USB-IDS-LICENSE.txt LICENSE CHANGELOG.md BUILD.txt > SHA256SUMS)
           tar -czf "target/release-assets/$ASSET_NAME.tar.gz" -C target/release-package .
