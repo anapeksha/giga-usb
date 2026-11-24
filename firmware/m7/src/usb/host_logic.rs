@@ -4,6 +4,7 @@
 
 use super::types::{CapturedEvent, UsbError, UsbEvent};
 use shared::protocol::{Event, Message};
+use shared::usb::proxy::ProxySupport;
 
 fn raw_trace(message: &Message) -> bool {
     message.event == Event::Usb
@@ -46,6 +47,7 @@ pub(super) struct BootEndpoint {
     pub(super) packet: u16,
     pub(super) interval: u8,
     pub(super) boot: bool,
+    pub(super) protocol: u8,
     pub(super) report_length: u16,
 }
 
@@ -63,6 +65,25 @@ pub(super) struct SelectedConfig {
     pub(super) configuration: u8,
     pub(super) hid: heapless::Vec<BootEndpoint, 4>,
     pub(super) storage: Option<StorageEndpoint>,
+}
+
+impl SelectedConfig {
+    pub(super) fn proxy_support(&self, protocol: u8) -> ProxySupport {
+        match self
+            .hid
+            .iter()
+            .filter(|ep| ep.boot && ep.protocol == protocol)
+            .count()
+        {
+            0 => ProxySupport::Absent,
+            1 => ProxySupport::Boot,
+            _ => ProxySupport::Ambiguous,
+        }
+    }
+}
+
+pub(super) fn led_setup(interface: u8) -> [u8; 8] {
+    [0x21, 9, 0, 2, interface, 0, 1, 0]
 }
 
 /// Private channel programming parameters, not a capture/wire contract.
@@ -84,6 +105,18 @@ impl Packet {
         }
     }
 
+    pub(super) fn valid_buffers(self, out_length: usize, input_length: usize) -> bool {
+        self.mps != 0
+            && self.mps <= 64
+            && out_length <= usize::from(self.mps)
+            && input_length <= usize::from(self.mps)
+            && if self.endpoint & 0x80 != 0 {
+                out_length == 0
+            } else {
+                input_length == 0
+            }
+    }
+
     pub(super) fn transfer_size(self, out_length: usize) -> u32 {
         // IN always reserves one MPS in the controller, even for status ZLPs.
         // OUT ZLPs have XFRSIZ=0 but still require PKTCNT=1 and DATA1.
@@ -93,6 +126,44 @@ impl Packet {
             out_length as u32
         };
         size | (1 << 19) | (self.pid << 29)
+    }
+}
+
+/// Exact-length control OUT data stage. wLength terminates a full-size final
+/// packet: adding a ZLP there would incorrectly extend the data stage.
+pub(super) struct ControlOut {
+    length: usize,
+    mps: usize,
+    offset: usize,
+    pid: u32,
+}
+impl ControlOut {
+    pub(super) fn new(setup: [u8; 8], length: usize, mps: u16) -> Result<Self, UsbError> {
+        if setup[0] & 0x80 != 0
+            || usize::from(u16::from_le_bytes([setup[6], setup[7]])) != length
+            || !matches!(mps, 8 | 16 | 32 | 64)
+        {
+            return Err(UsbError::Unsupported);
+        }
+        Ok(Self {
+            length,
+            mps: usize::from(mps),
+            offset: 0,
+            pid: 2,
+        })
+    }
+}
+impl Iterator for ControlOut {
+    type Item = (core::ops::Range<usize>, u32);
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.offset == self.length {
+            return None;
+        }
+        let start = self.offset;
+        self.offset = (start + self.mps).min(self.length);
+        let pid = self.pid;
+        self.pid ^= 2;
+        Some((start..self.offset, pid))
     }
 }
 
@@ -177,6 +248,7 @@ pub(super) fn select_configuration(
     let mut interface = None;
     let mut selected = heapless::Vec::<BootEndpoint, 4>::new();
     let mut boot = false;
+    let mut protocol = 0;
     let mut report_length = 0;
     let mut storage_interface = None;
     let mut storage = None;
@@ -196,6 +268,7 @@ pub(super) fn select_configuration(
                 }
                 interface = (d[3] == 0 && d[5] == 3).then_some(d[2]);
                 boot = d[6] == 1 && matches!(d[7], 1 | 2);
+                protocol = d[7];
                 report_length = 0;
                 storage_interface =
                     (d[3] == 0 && d[5] == 8 && d[6] == 6 && d[7] == 0x50 && !low_speed)
@@ -266,6 +339,7 @@ pub(super) fn select_configuration(
                             packet,
                             interval: d[6],
                             boot,
+                            protocol,
                             report_length,
                         })
                         .map_err(|_| UsbError::Overflow)?;
@@ -295,6 +369,158 @@ fn boot_endpoint(bytes: &[u8], low_speed: bool) -> Result<(u8, Option<BootEndpoi
 mod tests {
     use super::*;
 
+    #[test]
+    fn led_control_setup_data1_and_status_in_are_exact() {
+        let setup = led_setup(3);
+        assert_eq!(setup, [0x21, 9, 0, 2, 3, 0, 1, 0]);
+        let mut data = ControlOut::new(setup, 1, 8).unwrap();
+        assert_eq!(data.next(), Some((0..1, 2)));
+        assert_eq!(data.next(), None);
+        assert_eq!(
+            Packet::control(0, 3, 8).transfer_size(8),
+            8 | (1 << 19) | (3 << 29)
+        );
+        assert_eq!(
+            Packet::control(0, 2, 8).transfer_size(1),
+            1 | (1 << 19) | (2 << 29)
+        );
+        assert_eq!(
+            Packet::control(0x80, 2, 8).transfer_size(0),
+            8 | (1 << 19) | (2 << 29)
+        );
+    }
+    #[test]
+    fn control_out_lengths_toggles_and_zlp_boundaries() {
+        for (length, expected) in [(0, 0), (1, 1), (8, 1), (9, 2), (16, 2), (17, 3)] {
+            let setup = [0x21, 9, 0, 2, 0, 0, length as u8, 0];
+            let mut total = 0;
+            let mut packets = 0;
+            for (range, pid) in ControlOut::new(setup, length, 8).unwrap() {
+                assert_eq!(range.start, total);
+                assert_eq!(pid, if packets % 2 == 0 { 2 } else { 0 });
+                assert!(range.len() <= 8);
+                total = range.end;
+                packets += 1;
+            }
+            assert_eq!(packets, expected);
+            assert_eq!(total, length);
+        }
+        assert!(ControlOut::new(led_setup(0), 0, 8).is_err());
+        assert!(ControlOut::new(led_setup(0), 2, 8).is_err());
+        assert!(ControlOut::new(led_setup(0), 1, 0).is_err());
+        assert!(ControlOut::new([0xa1, 9, 0, 2, 0, 0, 1, 0], 1, 8).is_err());
+        assert!(!Packet::control(0, 2, 8).valid_buffers(9, 0));
+        assert!(!Packet::control(0, 2, 8).valid_buffers(1, 1));
+        assert!(!Packet::control(0x80, 2, 8).valid_buffers(1, 8));
+        assert!(!Packet::control(0x80, 2, 64).valid_buffers(0, 65));
+        assert!(Packet::control(0x80, 2, 8).valid_buffers(0, 0));
+    }
+    #[test]
+    fn proxy_selects_one_boot_interface_of_each_type_without_aggregation() {
+        let mut selected = SelectedConfig {
+            configuration: 1,
+            hid: heapless::Vec::new(),
+            storage: None,
+        };
+        assert_eq!(selected.proxy_support(1), ProxySupport::Absent);
+        let keyboard = BootEndpoint {
+            interface: 0,
+            endpoint: 0x81,
+            packet: 8,
+            interval: 10,
+            boot: true,
+            protocol: 1,
+            report_length: 0,
+        };
+        selected.hid.push(keyboard).unwrap();
+        selected
+            .hid
+            .push(BootEndpoint {
+                interface: 1,
+                endpoint: 0x82,
+                protocol: 2,
+                ..keyboard
+            })
+            .unwrap();
+        assert_eq!(selected.proxy_support(1), ProxySupport::Boot);
+        assert_eq!(selected.proxy_support(2), ProxySupport::Boot);
+        selected
+            .hid
+            .push(BootEndpoint {
+                interface: 2,
+                endpoint: 0x83,
+                ..keyboard
+            })
+            .unwrap();
+        assert_eq!(selected.proxy_support(1), ProxySupport::Ambiguous);
+        selected.hid.clear();
+        selected
+            .hid
+            .push(BootEndpoint {
+                boot: false,
+                protocol: 0,
+                report_length: 64,
+                ..keyboard
+            })
+            .unwrap();
+        assert_eq!(selected.proxy_support(1), ProxySupport::Absent);
+        assert_eq!(selected.proxy_support(2), ProxySupport::Absent);
+    }
+
+    #[test]
+    fn auxiliary_hid_does_not_block_keyboard_only_or_mouse_only_proxy() {
+        use shared::usb::proxy::ProxyToHost;
+        for protocol in [1, 2] {
+            let boot = BootEndpoint {
+                interface: 0,
+                endpoint: 0x81,
+                packet: 8,
+                interval: 10,
+                boot: true,
+                protocol,
+                report_length: 0,
+            };
+            let mut selected = SelectedConfig {
+                configuration: 1,
+                hid: heapless::Vec::new(),
+                storage: None,
+            };
+            selected.hid.push(boot).unwrap();
+            for interface in 1..4 {
+                selected
+                    .hid
+                    .push(BootEndpoint {
+                        interface,
+                        endpoint: 0x81 + interface,
+                        boot: false,
+                        protocol: 0,
+                        report_length: 64,
+                        ..boot
+                    })
+                    .unwrap();
+            }
+            assert_eq!(selected.proxy_support(protocol), ProxySupport::Boot);
+            assert_eq!(
+                selected.proxy_support(if protocol == 1 { 2 } else { 1 }),
+                ProxySupport::Absent
+            );
+            let p = crate::proxy::Proxy::new();
+            p.feedback(ProxyToHost::Output { connected: true });
+            p.support(selected.proxy_support(1), selected.proxy_support(2));
+            p.enable(p.status().generation, 0);
+            assert!(p.status().enabled);
+            selected.hid.pop();
+            selected
+                .hid
+                .push(BootEndpoint {
+                    interface: 3,
+                    endpoint: 0x84,
+                    ..boot
+                })
+                .unwrap();
+            assert_eq!(selected.proxy_support(protocol), ProxySupport::Ambiguous);
+        }
+    }
     fn captured(timestamp_us: u64, event: UsbEvent) -> Message {
         Message::encode(
             Event::Usb,

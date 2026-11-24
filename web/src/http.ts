@@ -50,6 +50,10 @@ export function createHttpController() {
     });
   });
   const [snapshot, setSnapshot] = createSignal(structuredClone(state));
+  const [controlState, setControlState] = createSignal({
+    proxy: state.proxy,
+    lifecycle: state.lifecycle,
+  });
   const [connected, setConnected] = createSignal(false);
   const [paused, setPaused] = createSignal(false);
   const [notice, setNotice] = createSignal({ message: 'Connecting to GIGA…', error: false });
@@ -138,6 +142,7 @@ export function createHttpController() {
             ensureCurrent();
             failDownloads();
             state = { ...createState(), transportDropped: 0 };
+            setControlState({ proxy: null, lifecycle: null });
             traceHistory = [];
             refreshGuard = createLossRefreshGuard();
             lastGenericError = undefined;
@@ -155,6 +160,7 @@ export function createHttpController() {
             ensureCurrent();
             if (page.dropped > state.transportDropped) failDownloads();
             applyEventPage(state, page);
+            setControlState({ proxy: state.proxy, lifecycle: state.lifecycle });
             for (const record of page.records) {
               if (record.event.type === 'error') {
                 const text = record.event.message;
@@ -230,6 +236,7 @@ export function createHttpController() {
     resetTrace();
     refreshGuard = createLossRefreshGuard();
     state = { ...createState(), transportDropped: 0 };
+    setControlState({ proxy: null, lifecycle: null });
     setPaused(false);
     publish();
     notify('Connecting to GIGA…', false, false);
@@ -329,6 +336,8 @@ export function createHttpController() {
       ready();
       return snapshot();
     },
+    proxyStatus: () => controlState().proxy,
+    hostReady: () => controlState().lifecycle === 'ready',
     traceFilters,
     filteredRecords,
     traceDropped,

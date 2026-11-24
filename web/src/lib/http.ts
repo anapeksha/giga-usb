@@ -6,6 +6,8 @@ import {
   type ProtocolState,
 } from './protocol';
 export type Command =
+  | { proxy_enable: { generation: number } }
+  | 'proxy_disable'
   | 'start'
   | 'stop'
   | 'reset'
@@ -174,20 +176,35 @@ async function diagnosticRequest<T>(
 
 const u32 = (value: unknown): value is number =>
   typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 0xffffffff;
+function validCommandObject(command: unknown): boolean {
+  if (typeof command !== 'object' || command === null || Array.isArray(command)) return false;
+  const entries = Object.entries(command);
+  if (entries.length !== 1) return false;
+  const [kind, value] = entries[0];
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  if (kind === 'proxy_enable')
+    return Object.keys(value).length === 1 && 'generation' in value && u32(value.generation);
+  return (
+    kind === 'storage_read' &&
+    'offset' in value &&
+    'file' in value &&
+    u32(value.offset) &&
+    value.offset <= 65536 &&
+    u32(value.file) &&
+    value.file <= 65535
+  );
+}
+
 export async function sendCommand(
-  command: string | { storage_read: { file: number; offset: number } },
+  command: unknown,
   signal: AbortSignal,
   request: typeof fetch = fetch,
   timeoutMs = REQUEST_TIMEOUT_MS,
 ): Promise<void> {
   if (
     typeof command === 'string'
-      ? !['start', 'stop', 'reset', 'status', 'storage_list'].includes(command)
-      : !command.storage_read ||
-        !u32(command.storage_read.offset) ||
-        command.storage_read.offset > 65536 ||
-        !u32(command.storage_read.file) ||
-        command.storage_read.file > 65535
+      ? !['start', 'stop', 'reset', 'status', 'storage_list', 'proxy_disable'].includes(command)
+      : !validCommandObject(command)
   )
     throw new Error('Unknown command');
   await diagnosticRequest(signal, timeoutMs, async (requestSignal) => {

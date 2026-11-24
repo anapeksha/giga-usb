@@ -122,7 +122,32 @@ export type HostEvent =
 export type ParsedHostEvent =
   | ['ready' | 'detached' | 'port_reset', Record<string, never>]
   | { [K in keyof HostPayloads]: [K, HostPayloads[K]] }[keyof HostPayloads];
+export type ProxySupport = 'absent' | 'boot' | 'unsupported' | 'ambiguous';
+export interface ProxyStatus {
+  release: 'pending' | 'released' | 'failed';
+  enabled: boolean;
+  output_connected: boolean;
+  ready: boolean;
+  session: number;
+  generation: number;
+  keyboard: ProxySupport;
+  mouse: ProxySupport;
+  fault:
+    | 'none'
+    | 'unsupported'
+    | 'invalid_report'
+    | 'backpressure'
+    | 'transport'
+    | 'sequence'
+    | 'heartbeat'
+    | 'output'
+    | 'led_transfer';
+  faults: number;
+  rejected_reports: number;
+  led_failures: number;
+}
 export type RecordEvent =
+  | { type: 'proxy'; status: ProxyStatus }
   | { type: 'hello'; protocol_version: number }
   | { type: 'host'; event: HostEvent }
   | { type: 'device'; descriptor: DeviceDescriptor }
@@ -139,6 +164,7 @@ export interface ProtocolRecord {
   event: RecordEvent;
 }
 export interface ProtocolState {
+  proxy: ProxyStatus | null;
   history: ProtocolRecord[];
   recordSequence: number;
   network?: NetworkInfo;
@@ -167,7 +193,7 @@ export interface ProtocolState {
 const object = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
 export const HISTORY_LIMIT = 500;
-export const PROTOCOL_VERSION = 9;
+export const PROTOCOL_VERSION = 10;
 const uint = (v: unknown, max = Number.MAX_SAFE_INTEGER): v is number =>
   typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 && v <= max;
 const fields = (v: unknown, names: string[]) =>
@@ -351,6 +377,31 @@ export function validRecord(r: unknown): r is ProtocolRecord {
   if (!object(r) || !uint(r.timestamp_ms) || !object(r.event)) return false;
   const e = r.event;
   switch (e.type) {
+    case 'proxy': {
+      const v = e.status;
+      return (
+        object(v) &&
+        ['pending', 'released', 'failed'].includes(v.release as string) &&
+        ['enabled', 'output_connected', 'ready'].every((k) => typeof v[k] === 'boolean') &&
+        ['session', 'generation', 'faults', 'rejected_reports', 'led_failures'].every((k) =>
+          uint(v[k], 0xffffffff),
+        ) &&
+        [v.keyboard, v.mouse].every((value) =>
+          ['absent', 'boot', 'unsupported', 'ambiguous'].includes(value as string),
+        ) &&
+        [
+          'none',
+          'unsupported',
+          'invalid_report',
+          'backpressure',
+          'transport',
+          'sequence',
+          'heartbeat',
+          'output',
+          'led_transfer',
+        ].includes(v.fault as string)
+      );
+    }
     case 'hello':
       return uint(e.protocol_version, 0xffffffff);
     case 'host':
@@ -417,6 +468,7 @@ export function validRecord(r: unknown): r is ProtocolRecord {
 }
 export function createState(): ProtocolState {
   return {
+    proxy: null,
     history: [],
     recordSequence: 0,
     lifecycle: null,
@@ -469,6 +521,15 @@ export function applyRecord(s: ProtocolState, r: unknown): boolean {
   }
   const e = r.event;
   switch (e.type) {
+    case 'proxy':
+      if (
+        (s.session === null || s.session === e.status.session) &&
+        (!s.proxy ||
+          s.proxy.session !== e.status.session ||
+          (e.status.generation - s.proxy.generation) >>> 0 < 0x80000000)
+      )
+        s.proxy = { ...e.status };
+      break;
     case 'hello':
       s.protocol = e.protocol_version;
       break;
@@ -511,7 +572,10 @@ export function applyRecord(s: ProtocolState, r: unknown): boolean {
       if (!parsed) return false;
       const [type, v] = parsed;
       if (type === 'lifecycle') {
-        if (s.session !== v.session_id) clearDevice(s);
+        if (s.session !== v.session_id) {
+          clearDevice(s);
+          if (s.proxy?.session !== v.session_id) s.proxy = null;
+        }
         s.session = v.session_id;
         s.lifecycle = v.state;
         s.enabled = v.state !== 'stopped';
@@ -596,6 +660,7 @@ export function summary(r: ProtocolRecord): string {
   if (e.type === 'error') return e.message;
   if (e.type === 'dropped') return `Gap · ${e.count} records dropped`;
   return {
+    proxy: 'Proxy status',
     hello: 'Connected',
     device: 'Device details',
     interface: 'Interface details',

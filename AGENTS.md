@@ -15,7 +15,9 @@ handshakes, CRCs, bus timing and arbitrary external traffic are not captured.
 
 - Keep one Cargo workspace: `firmware/m7`, `firmware/m4`, `firmware/shared`.
 - M7 owns USB-A host control, scheduling, capture, Wi-Fi and HTTP.
-- M4 owns descriptor/HID processing and secondary USB-C CDC diagnostics.
+- M4 owns descriptor/HID processing and USB-C composite CDC/boot-HID output.
+  Active proxy forwarding is opt-in and disabled at boot; never enable it as a
+  side effect of Start, reconnect, status refresh, or snapshot replay.
 - Shared contains only protocol, IPC, logging and Wi-Fi contracts, USB types,
   and shared HAL metadata. Its only feature is `defmt`; there are no `m7`/`m4`
   selectors.
@@ -130,6 +132,74 @@ is a GDB server, not a DAP server.
   software tests do not establish these hardware results. Authorization alone
   is not evidence that provisioning or any hardware check completed.
 
+### Verified single-file installer
+
+`web/src/installer/{verify,install,cli,build}.ts` builds a Node 24 host-side
+`.installer.mjs`, not an image for the MCU. Runtime is offline, macOS/Linux, and
+requires an explicit CubeProgrammer executable, probe serial, independent trusted
+Ed25519 public key and durable backup directory. Verify-only is the default;
+`--install` is required for board access. The bootstrap must itself come from a
+trusted source: self-comparison with the signed runtime is consistency checking,
+not authentication of already executing untrusted code. Never embed a private key.
+
+Authenticate the MCUboot header/hash/key/signature before bounded decompression;
+reject archive traversal, duplicate/unknown members, links and malformed metadata.
+Validate checksums, core-specific ELF vectors/load ranges, dashboard bounds/CRC,
+loader identity and runtime manifests before executing any board command. The
+single installer embeds the same signed archive distributed separately; do not
+flash the container. CI builds the loader/runtime into that authenticated archive,
+then builds and verification-only tests the wrapper and uploads it as a fifth asset.
+
+The standalone provisioning tool `firmware/m7/installer/loader.rs` is **not an
+application** or a second Cargo workspace. Its small, isolated unsafe boundary is
+for volatile register/RAM access in a reset-held diagnostic environment, not a
+relaxation of either application's unsafe-code prohibition. Build with
+`node web/src/installer/build.ts loader OUTPUT_DIRECTORY`; the source ABI is in
+`firmware/m7/installer/manifest.json`. Native tests use `rustc --edition 2024 --test
+-D warnings firmware/m7/installer/loader.rs -o target/installer-loader-tests`.
+CI separately formats, tests and cross-builds this loader.
+
+Loader code is confined to `0x24000000..0x24010000`; mailbox starts at
+`0x24010000`, data at `0x24012000`, stack below `0x20020000`. Every invocation
+checks HSI64/DIV1 and applied-divider readiness, clock dividers, M4 held, caches
+and MPU disabled, and advancing DWT before GPIO/SPI. Fixed JEDEC/SFDP gates and
+bounded WIP waits apply. Only reads, allocated 4-KiB sector replacement and final
+32-byte header commit are supported; never chip erase, status/protection writes,
+OTP/security or option writes. The host creates a fresh RAM-only ELF with standard
+section headers, records staged input before execution, and the loader checks input
+CRC before WREN. Short header input is padded in RAM only; flash length stays 32.
+
+Installer policy: identify/release existing probe owners; never kill them. Use a
+per-probe lock, two independent full external reads, saved SHA-256, internal and
+all 41 actual Cube option/protection fields. Reject unknown configurations, stale
+sectors and arbitrary occupied ranges; `--replace-dashboard` approves only a valid
+existing dashboard. Program payload with erased header, verify all staged bytes,
+commit header last, compare the entire external array outside the touched range,
+then flash M4/M7 and compare every file-backed ELF load byte. Options must match
+exactly before final reset. Failed/uncertain writes are not retried automatically;
+record evidence and attempt bounded halt, never blindly boot partial firmware.
+`--resume-from` requires matching trusted prior backups, image/firmware/probe/options
+and fresh full reads; it accepts only an exact staged or committed image, not
+arbitrary damage. `--force-dashboard-rewrite` is an explicit test option requiring
+replacement consent and cannot be combined with resume.
+
+Installer validation passed: 208 web unit tests, 59 Chromium fixtures, 7 standalone
+loader native tests and 165 application native tests. Separate per-core release
+Clippy/builds passed with and without logging. A local logging-disabled package
+passed the signing, payload comparison, installer build and verify-only flow.
+GitHub Actions itself was not executed for these uncommitted workflow changes.
+
+Current-board installer evidence is under `target/installer-validation/`:
+attempt 5 completed exact staged-header recovery; attempt 6 completed the normal
+97-sector replacement, header commit, M4/M7 readback and system reset. Outside-range
+bytes and option settings were preserved. These used ephemeral **test-only** keys
+and current `defmt` development images, not a production signature or RC3. The test
+private key is not needed by users. Initial help-format, ELF-layout, clock-flag and
+short-input failures are retained as superseded evidence, not successful results.
+CDC protocol 10 and composite enumeration passed; proxy input remained disabled.
+HTTP/browser, active HID/release behavior and failure-halt persistence remain
+separate checks, not established by an installer exit code.
+
 ### GitHub CI and signed releases
 
 `.github/workflows/ci.yml` runs on pull requests and merge queues, without
@@ -149,7 +219,8 @@ must not change option bytes, RDP, protection settings, OTP or security areas.
 The matching `## [<tag>]` entry in root `CHANGELOG.md` supplies the release notes;
 maintain an `Unreleased` section and add each tagged entry before releasing.
 Missing or empty entries fail the workflow. It packages both ELFs, the gzip UI,
-external QSPI container/metadata, provisioning safety guide, USB registry notices,
+external QSPI container/metadata, verified installer runtime and RAM loader,
+provisioning guidance, USB registry notices,
 changelog, checksums and build identity, then signs and
 verifies the archive with `imgtool` 2.5.0. `softprops/action-gh-release@v3` uploads
 only release assets, without replacing existing assets; no Actions artifacts are
@@ -293,6 +364,69 @@ multi-LUN, CDC-host and isochronous transfers remain future work.
   using read-only workflows. Never destructively format a user's disk or modify
   it to manufacture fragmentation; unavailable specimens remain NOT RUN.
 
+## Active boot-HID proxy
+
+This is an active bridge, not passive capture. USB-C always exposes CDC plus
+separate generic boot keyboard/mouse interfaces; diagnostics-only mode submits
+no HID interrupt reports. Do not impersonate the attached peripheral's identity.
+M7 owns physical USB-A polling, boot protocol selection and keyboard LED class
+SET_REPORT transfers. M4 validates exact boot packets and owns USB-C endpoint
+submission/retirement. Shared holds contracts only; neither core accesses the
+other's controller. No new Cargo feature selects proxy behavior.
+
+Protocol 10 appends proxy commands/events. Enable is externally tagged JSON:
+`{"command":{"proxy_enable":{"generation":42}}}` with the generation captured
+from the latest proxy status when the user explicitly requests enable; 42 is an
+example, not a default. Disable is `{"command":"proxy_disable"}`. Legacy string
+Enable is rejected. Generation checks at CDC admission, dequeue, transport retry
+and M7 execution prevent stale buffered commands from authorizing a new session.
+They are concurrency guards, not authentication; the open AP remains trusted-only.
+HTTP 202 remains acceptance, never a forwarding/release confirmation.
+
+Proxy input uses dedicated bounded ordered queues with one retained transport
+frame, independent of UI capture/serial/browser queues. Reports are acknowledged
+after USB-C endpoint retirement, not FIFO submission. Never retry relative mouse
+motion after uncertain completion. Host heartbeats are independent of changing
+reports so a legitimately held key is not released just because polling NAKs.
+Stop, Reset USB, detach, session changes, disable and output-link changes invalidate
+input and require fresh neutralization/authorization. Key/button release status
+(`pending`, `released`, `failed`) is separate from the enabled latch; do not hide
+an unconfirmed release behind a disabled indicator.
+
+Support is one boot keyboard and one boot mouse, including distinct interfaces
+of a directly attached receiver. Duplicate same-kind boot interfaces are ambiguous;
+auxiliary non-boot interfaces are ignored, not forwarded. Keyboard reports are
+exactly eight bytes, six non-modifier usages 0x04..0x65 plus modifiers; rollover,
+duplicate/error usages and malformed reports fail closed. Mouse reports are exactly
+three bytes, three buttons and signed X/Y -127..127; no wheel/report IDs. PC
+Num/Caps/Scroll LED changes go through M4 -> M7; only M7 sends physical SET_REPORT
+with explicit SETUP, DATA1 OUT and DATA1 IN status sequencing and deadlines.
+
+USB-C endpoint retirement uses safe typed PAC checks. A single M4 lifecycle owner
+polls device/HID/CDC futures; application code never issues global FIFO flushes.
+On uncertain output it drops those futures, soft-disconnects, deactivates the
+non-control endpoints and never reuses that device instance. USB-C HID and CDC
+remain unavailable until physical board reset/power cycle; Reset USB only resets
+the USB-A host. IPC/HTTP continue. This conservative terminal latch avoids the
+locked driver's stale OUT/control software-state recovery hazard without a vendor
+patch or unsafe application code. Normal diagnostics reconnects do not themselves
+start HID output. No claim of guaranteed release to an unresponsive PC is valid.
+
+Software validation: 165 native tests, 208 web unit tests and 59 Chromium fixture
+tests passed; separate per-core release Clippy/builds passed with and without
+logging. Final largest identified frames are M7 18,304 bytes and M4 5,296 bytes;
+compiled inspection is not a formal interrupt/indirect-call stack bound. Evidence
+is under `target/boot-hid-proxy-generation/`. Hardware forwarding checks remain
+NOT RUN: keyboard/mouse transitions and releases, LED output, NAK-idle held keys,
+USB-C reset/suspend/disconnect, bounded queue stalls, terminal disconnect,
+CDC coexistence under input and sustained USB/AP traffic. Use non-sensitive input
+on a separate test computer and retain sanitized evidence. Development `defmt`
+images and matching assets were subsequently flashed and
+verified, including through the single installer; CDC reported proxy disabled and
+macOS enumerated CDC/boot-keyboard/boot-mouse interfaces. This does not validate
+actual forwarding or release behavior. Deploy both cores and the protocol-10 UI
+together.
+
 ## IPC and contracts
 
 Shared owns all commands/events. IPC uses bounded, serialized messages and
@@ -369,8 +503,11 @@ secure-context-only APIs for the HTTP UI.
 ## Web implementation
 
 Application code and tests belong in `web/src` as TypeScript/TSX. Use SolidJS,
-source-copied solid-ui components, Tailwind v4 via its Vite plugin, ESLint and
-Prettier. No separate PostCSS pipeline or root JavaScript application modules.
+source-copied solid-ui components, Vite 8, Tailwind v4 via its Vite plugin, ESLint
+and Prettier. TypeScript 7 is stable but currently outside typescript-eslint's
+supported peer range (`>=4.8.4 <6.1.0`); retain TypeScript 5.9 until the lint
+integration supports upgrading. Do not force incompatible peers or use a preview
+compiler for release checks. No separate PostCSS pipeline or root JavaScript application modules.
 Keep a consistent dark theme, accessible focus states and clear error messages.
 Use Vitest for unit tests and Playwright for end-to-end tests under `web/src/e2e`.
 Browser tests serve the built gzip bundle on loopback with intercepted API

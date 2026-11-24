@@ -9,12 +9,12 @@ import {
   summary,
 } from './protocol';
 const record = (event: unknown) => ({ timestamp_ms: 42, event });
-test('protocol version is 9', () => {
-  assert.equal(PROTOCOL_VERSION, 9);
-  const golden = JSON.parse('{"timestamp_ms":42,"event":{"type":"hello","protocol_version":9}}');
+test('protocol version is 10', () => {
+  assert.equal(PROTOCOL_VERSION, 10);
+  const golden = JSON.parse('{"timestamp_ms":42,"event":{"type":"hello","protocol_version":10}}');
   const state = createState();
   assert.equal(applyRecord(state, golden), true);
-  assert.equal(state.protocol, 9);
+  assert.equal(state.protocol, 10);
 });
 
 test('network JSON golden retains diagnostics without changing USB state', () => {
@@ -291,4 +291,129 @@ test('history is a bounded 500-record ring and fresh sessions are empty', () => 
   assert.equal(s.history[0].timestamp_ms, 200);
   assert.equal(s.history.at(-1)?.timestamp_ms, 699);
   assert.equal(createState().history.length, 0);
+});
+
+test('proxy snapshots validate every field and remain outside USB history', () => {
+  const status = {
+    enabled: false,
+    output_connected: true,
+    ready: false,
+    release: 'pending',
+    session: 1,
+    generation: 2,
+    keyboard: 'boot',
+    mouse: 'absent',
+    fault: 'none',
+    faults: 0,
+    rejected_reports: 0,
+    led_failures: 0,
+  };
+  const state = createState();
+  assert.equal(state.proxy, null);
+  const proxy = (value: unknown) => record({ type: 'proxy', status: value });
+  assert.equal(applyRecord(state, proxy(status)), true);
+  assert.deepEqual(state.proxy, status);
+  assert.deepEqual(state.history, []);
+  const invalid: unknown[] = [null, [], {}, 'status'];
+  for (const key of Object.keys(status)) {
+    const missing = { ...status } as Record<string, unknown>;
+    delete missing[key];
+    invalid.push(
+      missing,
+      { ...status, [key]: null },
+      { ...status, [key]: '<script>alert(1)</script>' },
+    );
+  }
+  for (const key of ['session', 'generation', 'faults', 'rejected_reports', 'led_failures'])
+    for (const value of [-1, 1.5, 0x100000000, Infinity, NaN])
+      invalid.push({ ...status, [key]: value });
+  for (const value of invalid) {
+    const before = structuredClone(state);
+    assert.equal(applyRecord(state, proxy(value)), false);
+    assert.deepEqual(state, before);
+  }
+  for (const fault of [
+    'none',
+    'unsupported',
+    'invalid_report',
+    'backpressure',
+    'transport',
+    'sequence',
+    'heartbeat',
+    'output',
+    'led_transfer',
+  ])
+    assert.equal(validRecord(proxy({ ...status, fault })), true);
+  for (const support of ['absent', 'boot', 'unsupported', 'ambiguous'])
+    assert.equal(validRecord(proxy({ ...status, keyboard: support, mouse: support })), true);
+});
+
+test('proxy state follows snapshots, sessions and wrapping generations without stale readiness', () => {
+  const state = createState();
+  const status = {
+    enabled: true,
+    output_connected: true,
+    ready: true,
+    release: 'released',
+    session: 1,
+    generation: 0xffffffff,
+    keyboard: 'boot',
+    mouse: 'absent',
+    fault: 'none',
+    faults: 0,
+    rejected_reports: 0,
+    led_failures: 0,
+  };
+  const emit = (patch = {}) =>
+    applyRecord(state, record({ type: 'proxy', status: { ...status, ...patch } }));
+  emit();
+  applyRecord(
+    state,
+    record({ type: 'host', event: { lifecycle: { state: 'ready', session_id: 1 } } }),
+  );
+  assert.equal(state.proxy?.ready, true);
+  emit({ generation: 0, enabled: false, ready: false });
+  emit();
+  assert.equal(state.proxy?.enabled, false);
+  applyRecord(
+    state,
+    record({ type: 'host', event: { lifecycle: { state: 'waiting', session_id: 2 } } }),
+  );
+  assert.equal(state.proxy, null);
+  emit();
+  assert.equal(state.proxy, null);
+  emit({ session: 2, generation: 1, enabled: false, ready: false });
+  assert.equal((state as ReturnType<typeof createState>).proxy?.session, 2);
+  assert.equal(createState().proxy, null);
+});
+
+test('release proof is mandatory and never inferred from disabled or generation changes', () => {
+  const state = createState();
+  const status = {
+    enabled: false,
+    output_connected: false,
+    ready: false,
+    session: 1,
+    generation: 1,
+    keyboard: 'absent',
+    mouse: 'absent',
+    fault: 'output',
+    faults: 1,
+    rejected_reports: 0,
+    led_failures: 0,
+  };
+  const emit = (patch: Record<string, unknown>) =>
+    applyRecord(state, record({ type: 'proxy', status: { ...status, ...patch } }));
+  for (const release of [undefined, null, false, 0, {}, [], 'unknown', '<script>']) {
+    assert.equal(emit({ release }), false);
+    assert.equal(state.proxy, null);
+  }
+  for (const release of ['pending', 'failed', 'released', 'pending']) {
+    assert.equal(emit({ release }), true);
+    assert.equal((state as ReturnType<typeof createState>).proxy?.release, release);
+  }
+  emit({ release: 'failed', generation: 2 });
+  emit({ release: 'failed', generation: 3, output_connected: true });
+  assert.equal((state as ReturnType<typeof createState>).proxy?.release, 'failed');
+  assert.deepEqual(state.history, []);
 });

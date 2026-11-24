@@ -31,6 +31,19 @@ impl Pending {
         assert!(self.is_none());
         self.0 = message;
     }
+    /// Explicit safety invalidation, never an overflow/Full retry policy.
+    /// Proxy generations may become obsolete while an exact frame is retained.
+    pub fn discard_if(
+        &mut self,
+        predicate: impl FnOnce(&crate::protocol::Message) -> bool,
+    ) -> bool {
+        if self.0.as_ref().is_some_and(predicate) {
+            self.0 = None;
+            true
+        } else {
+            false
+        }
+    }
     pub fn retry(
         &mut self,
         mut send: impl FnMut(&crate::protocol::Message) -> Result<(), crate::ipc::SendError>,
@@ -114,6 +127,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn safety_invalidation_does_not_replace_a_current_full_frame() {
+        use crate::{protocol::Event, usb::proxy::HostToProxy};
+        let frame = HostToProxy::Heartbeat {
+            session: 1,
+            generation: 2,
+        };
+        let mut pending = Pending::new();
+        pending.set(Some(Message::encode(Event::Proxy, &frame).unwrap()));
+        pending.retry(|_| Err(SendError::Full)).unwrap();
+        assert!(!pending.discard_if(|m| m.decode::<HostToProxy>().unwrap().generation() != 2));
+        assert!(!pending.is_none());
+        assert!(pending.discard_if(|m| m.decode::<HostToProxy>().unwrap().generation() != 3));
+        assert!(pending.is_none());
+    }
     #[test]
     fn channel_receive_future_wakes_when_capacity_peer_recovers() {
         let queue = Queue::<u32, 1>::new();

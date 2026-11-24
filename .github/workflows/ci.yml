@@ -37,6 +37,13 @@ jobs:
         run: rustup show active-toolchain
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
+      - name: Check standalone installer RAM loader (no hardware)
+        run: |
+          mkdir -p target/ci-installer-loader
+          rustfmt --edition 2024 --check firmware/m7/installer/loader.rs
+          rustc --edition 2024 --test -D warnings firmware/m7/installer/loader.rs -o target/installer-loader-tests
+          target/installer-loader-tests
+          node web/src/installer/build.ts loader target/ci-installer-loader
       - name: Test native libraries
         run: |
           cargo test -p shared --target x86_64-unknown-linux-gnu --lib --locked

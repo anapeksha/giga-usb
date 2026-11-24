@@ -90,7 +90,10 @@ jobs:
             rustc --version
             printf 'Features: none (defmt disabled)\nExternal dashboard assets required; read README.md and AGENTS.md provisioning instructions before deployment.\nFlash M4 then M7; verify and system-reset. M7 overwrites the Arduino bootloader.\n'
           } > target/release-package/BUILD.txt
-          (cd target/release-package && sha256sum m4.elf m7.elf index.html.gz dashboard.qspi.bin dashboard.qspi.bin.json README.md AGENTS.md USB-IDS-LICENSE.txt LICENSE CHANGELOG.md BUILD.txt > SHA256SUMS)
+          node web/src/installer/build.ts loader target/release-package
+          node web/src/installer/build.ts runtime target/release-package/installer-runtime.mjs
+          node web/src/installer/build.ts manifest target/release-package
+          (cd target/release-package && sha256sum m4.elf m7.elf index.html.gz dashboard.qspi.bin dashboard.qspi.bin.json README.md AGENTS.md USB-IDS-LICENSE.txt LICENSE CHANGELOG.md BUILD.txt qspi-loader.elf qspi-loader.json installer-runtime.mjs installer-manifest.json > SHA256SUMS)
           tar -czf "target/release-assets/$ASSET_NAME.tar.gz" -C target/release-package .
       - name: Install signing tool
         run: python -m pip install --disable-pip-version-check imgtool==2.5.0
@@ -115,7 +118,17 @@ jobs:
           dd if="target/release-assets/$ASSET_NAME.signed.bin" bs=1 skip=512 \
             count="$(wc -c < "target/release-assets/$ASSET_NAME.tar.gz")" status=none \
             | cmp - "target/release-assets/$ASSET_NAME.tar.gz"
-          (cd target/release-assets && sha256sum "$ASSET_NAME.tar.gz" "$ASSET_NAME.signed.bin" "$ASSET_NAME-public.pem" > "$ASSET_NAME-SHA256SUMS")
+      - name: Build and verify standalone installer (no hardware)
+        shell: bash
+        run: |
+          node web/src/installer/build.ts package \
+            "target/release-assets/$ASSET_NAME.signed.bin" \
+            target/release-package/installer-runtime.mjs \
+            "target/release-assets/$ASSET_NAME-public.pem" \
+            "target/release-assets/$ASSET_NAME.installer.mjs"
+          node "target/release-assets/$ASSET_NAME.installer.mjs" \
+            --key "target/release-assets/$ASSET_NAME-public.pem"
+          (cd target/release-assets && sha256sum "$ASSET_NAME.tar.gz" "$ASSET_NAME.signed.bin" "$ASSET_NAME-public.pem" "$ASSET_NAME.installer.mjs" > "$ASSET_NAME-SHA256SUMS")
       - name: Upload release assets
         uses: softprops/action-gh-release@v3
         with:
@@ -127,5 +140,6 @@ jobs:
           files: |
             target/release-assets/${{ env.ASSET_NAME }}.tar.gz
             target/release-assets/${{ env.ASSET_NAME }}.signed.bin
+            target/release-assets/${{ env.ASSET_NAME }}.installer.mjs
             target/release-assets/${{ env.ASSET_NAME }}-public.pem
             target/release-assets/${{ env.ASSET_NAME }}-SHA256SUMS

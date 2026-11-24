@@ -7,6 +7,74 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [v0.1.0-rc3] - 2026-11-24
+
+Third release candidate, adding opt-in boot-HID forwarding and a single verified
+installer. This remains experimental firmware. Forwarding is disabled at boot;
+installer verification alone does not access the board.
+
+### Added
+
+- Explicitly enabled active boot-keyboard and boot-mouse proxying through USB-C,
+  alongside CDC diagnostics. M7 polls the physical USB-A device; M4 validates
+  and forwards bounded reports through generic emulated HID interfaces.
+- Dedicated ordered proxy IPC with consumption acknowledgments, generation-bound
+  enable requests, heartbeats, release-status reporting and fail-closed overflow.
+- Keyboard Num/Caps/Scroll LED forwarding using M7-owned control data-OUT transfers.
+- Dashboard support/status and Enable/Disable controls; no automatic forwarding.
+- A single offline, verified Node.js installer containing the signed firmware,
+  dashboard and bounded part-specific RAM loader. Explicit installation performs
+  backup, header-last QSPI provisioning, M4/M7 programming and exact readback
+  without changing option bytes or protection/security settings.
+- Strict interrupted-header recovery using trusted prior backups and fresh reads;
+  failed or uncertain writes are not automatically retried or blindly booted.
+
+### Changed
+
+- Protocol 10 adds proxy commands and events; both core images and the external
+  dashboard must be deployed together. RC1 and RC2 use protocol 9.
+- Shortened proxy guidance in the dashboard; actionable board-reset instructions
+  appear only when input release fails.
+- Upgraded Vite to 8.3.8. TypeScript remains on 5.9 because stable
+  `typescript-eslint` does not yet support TypeScript 7; no peer checks are bypassed.
+- Uncertain proxy output latches USB-C HID and CDC off until physical board reset
+  or power cycle. This avoids reusing uncertain endpoint state; HTTP remains
+  available. Software tests do not establish actual PC forwarding or recovery.
+- Release packaging now includes the authenticated installer runtime/loader and a
+  self-contained `.installer.mjs` asset, verification-only tested in CI. Production
+  firmware remains logging-disabled. Current-board normal installation and staged
+  header recovery passed using test-signed development images; actual HID input
+  and on-board HTTP/browser checks remain separate.
+
+### Validation and known limitations
+
+- Passed 208 web unit tests, 59 Chromium fixtures, 165 application native tests,
+  seven standalone loader tests, formatting/lint/type checks, and separate
+  per-core release Clippy/builds with and without logging.
+- The installer completed normal 97-sector replacement and interrupted-header
+  recovery on the current board, preserving unrelated flash bytes and option
+  settings. These checks used test-signed development images, not the RC3 archive.
+- CDC protocol 10 and composite keyboard/mouse enumeration passed. Actual input
+  forwarding, key/button releases, keyboard LEDs, output-fault recovery and
+  sustained USB/AP coexistence remain hardware-unverified.
+- On-board HTTP transfer/browser rendering and real-media storage checks remain
+  outstanding. Software fixtures and successful startup do not establish them.
+
+### Installation and verification
+
+- Use the single `giga-usb-v0.1.0-rc3.installer.mjs` from a trusted source with an
+  independently trusted Ed25519 public key. It requires Node.js 24+ and an explicit
+  STM32CubeProgrammer executable, probe serial and durable backup directory on
+  macOS/Linux. No Rust compiler, imgtool or runtime Internet access is needed.
+- Run with `--key trusted-public.pem` for verification only. Add `--install` and
+  the required programmer/probe/backup arguments to install; see `README.md`.
+- The installer verifies the signed archive before board access, provisions the
+  dashboard header last, flashes M4 then M7, and verifies readback and preservation
+  before system reset. Existing unrelated data, option bytes and OTP/security
+  areas are not modified. Flashing M7 overwrites the Arduino bootloader.
+- **Never flash the signed container or installer itself as MCU firmware.** This
+  is host-side distribution verification, not enforced secure boot.
+
 ## [v0.1.0-rc2] - 2026-11-22
 
 Second release candidate. This supersedes rc1 for distribution without logging;
@@ -113,6 +181,7 @@ limited; review the known limitations and installation requirements below.
   require mass erase or option-byte changes. Preserve existing external data
   unless its owner explicitly authorizes discarding it.
 
-[Unreleased]: https://github.com/anapeksha/giga-usb/compare/v0.1.0-rc2...HEAD
+[Unreleased]: https://github.com/anapeksha/giga-usb/compare/v0.1.0-rc3...HEAD
+[v0.1.0-rc3]: https://github.com/anapeksha/giga-usb/compare/v0.1.0-rc2...v0.1.0-rc3
 [v0.1.0-rc2]: https://github.com/anapeksha/giga-usb/compare/v0.1.0-rc1...v0.1.0-rc2
 [v0.1.0-rc1]: https://github.com/anapeksha/giga-usb/releases/tag/v0.1.0-rc1
