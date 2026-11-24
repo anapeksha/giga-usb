@@ -25,7 +25,7 @@ serde-json-core.workspace = true
 cortex-m-rt.workspace = true
 panic-halt.workspace = true
 embassy-executor.workspace = true
-embassy-stm32 = { workspace = true, features = ["stm32h747xi-cm4", "time-driver-tim5"] }
+embassy-stm32 = { workspace = true, features = ["stm32h747xi-cm4", "time-driver-tim5", "unstable-pac"] }
 embassy-time.workspace = true
 embassy-usb.workspace = true
 static_cell.workspace = true

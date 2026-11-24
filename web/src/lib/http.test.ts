@@ -207,6 +207,9 @@ test('commands use JSON POST and require 202; queue full is actionable', async (
     'reset',
     'status',
     'storage_list',
+    { proxy_enable: { generation: 0 } },
+    { proxy_enable: { generation: 0xffffffff } },
+    'proxy_disable',
     { storage_read: { file: 31, offset: 65536 } },
   ]) {
     await sendCommand(command, signal, async (url, options) => {
@@ -228,4 +231,28 @@ test('commands use JSON POST and require 202; queue full is actionable', async (
     sendCommand('start', signal, async () => new Response(null, { status: 200 })),
     /HTTP 200/,
   );
+});
+
+test('proxy enable rejects legacy and malformed generations without issuing requests', async () => {
+  const signal = new AbortController().signal;
+  for (const command of [
+    'proxy_enable',
+    null,
+    undefined,
+    [],
+    {},
+    { proxy_enable: null },
+    { proxy_enable: [] },
+    { proxy_enable: {} },
+    { proxy_enable: { generation: 1, extra: true } },
+    { proxy_enable: { generation: 1 }, proxy_disable: null },
+    ...[undefined, null, false, '1', -1, 1.5, 0x100000000, NaN, Infinity].map((generation) => ({
+      proxy_enable: { generation },
+    })),
+  ]) {
+    await assert.rejects(
+      sendCommand(command, signal, async () => assert.fail('invalid command sent')),
+      /Unknown command/,
+    );
+  }
 });

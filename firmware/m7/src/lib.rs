@@ -8,6 +8,7 @@ pub mod dashboard;
 pub mod event_stream;
 pub mod ipc_delivery;
 pub mod network_bus;
+pub mod proxy;
 pub mod status;
 pub mod trace_query;
 pub mod usb;

@@ -23,6 +23,7 @@ struct Queues {
     replay: bool,
     generation: u32,
     dropped: u32,
+    proxy: Option<shared::usb::proxy::ProxyStatus>,
 }
 fn raw_trace(record: &UiRecord) -> bool {
     matches!(
@@ -78,6 +79,7 @@ impl Bus {
                 replay: false,
                 generation: 0,
                 dropped: 0,
+                proxy: None,
             }),
             clock,
         )
@@ -85,6 +87,9 @@ impl Bus {
     pub fn emit(&self, timestamp_ms: u64, event: UiEvent) {
         let mut q = self.0.borrow_mut();
 
+        if let UiEvent::Proxy { status } = &event {
+            q.proxy = Some(*status);
+        }
         let record = UiRecord {
             timestamp_ms,
             event: event.clone(),
@@ -136,6 +141,10 @@ impl Bus {
     }
     pub fn replay_serial(&self, processor: &crate::usb::processor::Processor) {
         processor.snapshot(|event| self.emit_serial((self.1)(), event));
+        let status = self.0.borrow().proxy;
+        if let Some(status) = status {
+            self.emit_serial((self.1)(), UiEvent::Proxy { status });
+        }
     }
     /// IPC Status requests an M4 snapshot; it must not echo back to M7.
     pub fn accept_ipc_command(
@@ -148,6 +157,16 @@ impl Bus {
             Ok(())
         } else {
             self.accept_command(command)
+        }
+    }
+    /// An enable from an old USB-C session is not fresh authorization.
+    pub fn cancel_proxy_enable(&self) {
+        let q = self.0.borrow();
+        for _ in 0..q.input.len() {
+            let command = q.input.pop_front().expect("fixed command queue length");
+            if !matches!(command, HostCommand::ProxyEnable { .. }) {
+                let _ = q.input.push_back(command);
+            }
         }
     }
     pub fn command(&self) -> Option<HostCommand> {
@@ -232,6 +251,27 @@ mod tests {
     use shared::ipc::SendError;
     use shared::ipc_delivery::Pending;
 
+    #[test]
+    fn usb_session_change_cancels_only_old_enables_preserving_other_command_order() {
+        let bus = Bus::new(|| 0);
+        for command in [
+            HostCommand::ProxyEnable { generation: 7 },
+            HostCommand::Stop,
+            HostCommand::ProxyDisable,
+            HostCommand::Status,
+        ] {
+            bus.accept_command(command).unwrap();
+        }
+        bus.cancel_proxy_enable();
+        for expected in [
+            HostCommand::Stop,
+            HostCommand::ProxyDisable,
+            HostCommand::Status,
+        ] {
+            assert_eq!(bus.command(), Some(expected));
+        }
+        assert_eq!(bus.command(), None);
+    }
     fn raw(value: u8) -> UiEvent {
         UiEvent::Host {
             event: UsbEvent::Transfer {

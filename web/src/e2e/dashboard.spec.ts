@@ -360,7 +360,7 @@ test('storage downloads 301 bytes in ordered 128-byte chunks with matching SHA-2
         event: { file: { index: 0, name: 'TEST.BIN', size: bytes.length, directory: false } },
       });
     }
-    if (typeof command === 'object') {
+    if (typeof command === 'object' && 'storage_read' in command) {
       const { offset } = command.storage_read;
       api.emit({
         type: 'host',

@@ -17,12 +17,14 @@ pub fn should_drain(queued: usize, now_us: u64, until_us: u64) -> bool {
 }
 
 pub struct Delivery {
+    pub proxy: crate::proxy::Proxy,
     pub captures: Queue<Message, 64>,
     pub incoming: Queue<Message, 4>,
     pub failed: Cell<u32>,
     pub transport_errors: Cell<u32>,
     pub snapshot_requested: Cell<bool>,
     capture_turn: Cell<bool>,
+    proxy_turn: Cell<bool>,
     reported_errors: Cell<u32>,
     report_at_ms: Cell<u64>,
 }
@@ -34,7 +36,25 @@ impl Default for Delivery {
     }
 }
 impl Delivery {
+    pub fn cancel_proxy_enable(&self) {
+        for _ in 0..self.incoming.len() {
+            let frame = self
+                .incoming
+                .pop_front()
+                .expect("fixed incoming queue length");
+            if frame.event != shared::protocol::Event::Command
+                || !frame
+                    .decode::<shared::usb::types::HostCommand>()
+                    .is_ok_and(|command| {
+                        matches!(command, shared::usb::types::HostCommand::ProxyEnable { .. })
+                    })
+            {
+                let _ = self.incoming.push_back(frame);
+            }
+        }
+    }
     pub fn note_transport_error(&self) {
+        self.proxy.fault(shared::usb::proxy::ProxyFault::Transport);
         self.transport_errors
             .set(self.transport_errors.get().saturating_add(1));
     }
@@ -48,6 +68,10 @@ impl Delivery {
     /// Only consume the coalesced request once the frame owns the in-flight slot.
     pub fn fill_pending(&self, pending: &mut shared::ipc_delivery::Pending) {
         if !pending.is_none() {
+            return;
+        }
+        let proxy_turn = self.proxy_turn.replace(!self.proxy_turn.get());
+        if proxy_turn && self.fill_proxy(pending) {
             return;
         }
         if self.capture_turn.get()
@@ -74,7 +98,20 @@ impl Delivery {
         if let Some(message) = self.captures.pop_front() {
             pending.set(Some(message));
             self.capture_turn.set(false);
+        } else {
+            self.fill_proxy(pending);
         }
+    }
+
+    fn fill_proxy(&self, pending: &mut shared::ipc_delivery::Pending) -> bool {
+        if let Some(frame) = self.proxy.next_frame() {
+            match Message::encode(shared::protocol::Event::Proxy, &frame) {
+                Ok(message) => pending.set(Some(message)),
+                Err(_) => self.note_transport_error(),
+            }
+            return true;
+        }
+        false
     }
 
     pub fn report_transport_errors(&self, bus: &crate::network_bus::Bus, now_ms: u64) {
@@ -89,12 +126,14 @@ impl Delivery {
 
     pub const fn new() -> Self {
         Self {
+            proxy: crate::proxy::Proxy::new(),
             captures: Queue::new(),
             incoming: Queue::new(),
             failed: Cell::new(0),
             transport_errors: Cell::new(0),
             snapshot_requested: Cell::new(false),
             capture_turn: Cell::new(false),
+            proxy_turn: Cell::new(true),
             reported_errors: Cell::new(0),
             report_at_ms: Cell::new(0),
         }
@@ -140,6 +179,43 @@ impl CommandTurn {
 mod tests {
     use super::*;
     use shared::{protocol::Event, usb::types::HostCommand};
+    #[test]
+    fn output_link_change_invalidates_queued_enables_from_both_sources() {
+        let bus = crate::network_bus::Bus::new();
+        let delivery = Delivery::new();
+        for command in [
+            HostCommand::ProxyEnable { generation: 7 },
+            HostCommand::Stop,
+            HostCommand::ProxyDisable,
+            HostCommand::Status,
+        ] {
+            assert!(bus.command(command));
+            delivery
+                .incoming
+                .push_back(Message::encode(Event::Command, &command).unwrap())
+                .unwrap();
+        }
+        delivery.cancel_proxy_enable();
+        bus.cancel_proxy_enable();
+        for expected in [
+            HostCommand::Stop,
+            HostCommand::ProxyDisable,
+            HostCommand::Status,
+        ] {
+            assert_eq!(bus.next_command(), Some(expected));
+            assert_eq!(
+                delivery
+                    .incoming
+                    .pop_front()
+                    .unwrap()
+                    .decode::<HostCommand>()
+                    .unwrap(),
+                expected
+            );
+        }
+        assert_eq!(bus.next_command(), None);
+        assert!(delivery.incoming.is_empty());
+    }
     #[test]
     fn dispatch_is_bounded_fair_and_fifo() {
         let bus = crate::network_bus::Bus::new();

@@ -14,7 +14,7 @@ pub const MAX_PAYLOAD_SIZE: usize = 256;
 /// Includes postcard's event, option and length tags (260 bytes at maximum).
 pub const MAX_FRAME_SIZE: usize = 288;
 
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Event {
@@ -24,6 +24,7 @@ pub enum Event {
     Usb,
     Command,
     Ui,
+    Proxy,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

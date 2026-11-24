@@ -200,6 +200,15 @@ impl Bus {
         published
     }
 
+    pub fn cancel_proxy_enable(&self) {
+        let mut s = self.0.borrow_mut();
+        for _ in 0..s.commands.len() {
+            let command = s.commands.pop_front().expect("fixed command queue length");
+            if !matches!(command, HostCommand::ProxyEnable { .. }) {
+                let _ = s.commands.push_back(command);
+            }
+        }
+    }
     pub fn next_command(&self) -> Option<HostCommand> {
         self.0.borrow_mut().commands.pop_front()
     }

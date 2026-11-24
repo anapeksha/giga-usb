@@ -51,6 +51,11 @@ pub enum HostCommand {
         file: u16,
         offset: u32,
     },
+    /// Explicit intent bound to the current proxy snapshot, not authentication.
+    ProxyEnable {
+        generation: u32,
+    },
+    ProxyDisable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -277,6 +282,9 @@ pub enum UiEvent {
     Dropped {
         count: u32,
     },
+    Proxy {
+        status: super::proxy::ProxyStatus,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -289,6 +297,69 @@ pub struct UiRecord {
 mod tests {
     use super::*;
     use crate::protocol::{Event, Message};
+
+    #[test]
+    fn proxy_enable_requires_an_explicit_u32_generation() {
+        for json in [
+            &br#"{"command":"proxy_enable"}"#[..],
+            &br#"{"command":{"proxy_enable":{}}}"#[..],
+            &br#"{"command":{"proxy_enable":{"generation":-1}}}"#[..],
+            &br#"{"command":{"proxy_enable":{"generation":4294967296}}}"#[..],
+        ] {
+            assert!(serde_json_core::from_slice::<CommandRequest>(json).is_err());
+        }
+        let json = br#"{"command":{"proxy_enable":{"generation":0}}}"#;
+        let (request, used) = serde_json_core::from_slice::<CommandRequest>(json).unwrap();
+        assert_eq!(used, json.len());
+        assert_eq!(request.command, HostCommand::ProxyEnable { generation: 0 });
+    }
+    #[test]
+    fn proxy_commands_and_snapshot_json_contract() {
+        for (json, expected) in [
+            (
+                &br#"{"command":{"proxy_enable":{"generation":4294967295}}}"#[..],
+                HostCommand::ProxyEnable {
+                    generation: u32::MAX,
+                },
+            ),
+            (
+                &br#"{"command":"proxy_disable"}"#[..],
+                HostCommand::ProxyDisable,
+            ),
+        ] {
+            let (request, used) = serde_json_core::from_slice::<CommandRequest>(json).unwrap();
+            assert_eq!(used, json.len());
+            assert_eq!(request.command, expected);
+            let message = Message::encode(Event::Command, &expected).unwrap();
+            assert_eq!(message.decode::<HostCommand>().unwrap(), expected);
+        }
+        use crate::usb::proxy::{ProxyFault, ProxyRelease, ProxyStatus, ProxySupport};
+        let record = UiRecord {
+            timestamp_ms: 0,
+            event: UiEvent::Proxy {
+                status: ProxyStatus {
+                    enabled: false,
+                    output_connected: false,
+                    ready: false,
+                    release: ProxyRelease::Pending,
+                    session: 0,
+                    generation: 0,
+                    keyboard: ProxySupport::Absent,
+                    mouse: ProxySupport::Absent,
+                    fault: ProxyFault::None,
+                    faults: 0,
+                    rejected_reports: 0,
+                    led_failures: 0,
+                },
+            },
+        };
+        let mut bytes = [0; crate::protocol::RECORD_BYTES];
+        let n = serde_json_core::to_slice(&record, &mut bytes).unwrap();
+        assert_eq!(
+            core::str::from_utf8(&bytes[..n]).unwrap(),
+            r#"{"timestamp_ms":0,"event":{"type":"proxy","status":{"enabled":false,"output_connected":false,"ready":false,"release":"pending","session":0,"generation":0,"keyboard":"absent","mouse":"absent","fault":"none","faults":0,"rejected_reports":0,"led_failures":0}}}"#
+        );
+    }
 
     #[test]
     fn storage_commands_and_maximum_records_fit_transport() {
@@ -444,7 +515,7 @@ mod tests {
 
     #[test]
     fn raw_packets_roundtrip_and_fit_transport_bounds() {
-        assert_eq!(crate::protocol::PROTOCOL_VERSION, 9);
+        assert_eq!(crate::protocol::PROTOCOL_VERSION, 10);
         for (endpoint, direction, pid, payload) in [
             (0, Direction::Out, 3, &[0x80, 6, 0, 1, 0, 0, 18, 0][..]),
             (0x80, Direction::In, 0, &[255; 64][..]),

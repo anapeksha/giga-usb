@@ -24,6 +24,7 @@ use super::types::{
 use crate::ipc_delivery::Delivery;
 use crate::network_bus::Bus;
 use shared::protocol::{Event, Message};
+use shared::usb::proxy::{BootKind, ProxyFault, ProxySupport};
 
 const ENABLE: u32 = 1 << 31;
 const HALT: u32 = 1 << 30;
@@ -65,6 +66,8 @@ pub struct Host<'d> {
     attempt_retries: u32,
     failure_snapshot: Option<UsbEvent>,
     failure_emitted: bool,
+    proxy_keyboard: Option<u8>,
+    proxy_transfer_generation: Option<u32>,
 }
 
 impl<'d> Host<'d> {
@@ -108,6 +111,8 @@ impl<'d> Host<'d> {
             attempt_retries: 0,
             failure_snapshot: None,
             failure_emitted: false,
+            proxy_keyboard: None,
+            proxy_transfer_generation: None,
         }
     }
 
@@ -185,6 +190,7 @@ impl<'d> Host<'d> {
     }
 
     fn status(&mut self) {
+        self.delivery.proxy.snapshot();
         if let Some(info) = self.network.and_then(Bus::network) {
             self.emit(UsbEvent::Network { info });
         }
@@ -254,6 +260,7 @@ impl<'d> Host<'d> {
     }
 
     fn error(&mut self, code: UsbError) {
+        self.delivery.proxy.fault(ProxyFault::Transport);
         self.save_failure(code);
         self.lifecycle(HostState::Error);
         self.emit_failure();
@@ -269,7 +276,20 @@ impl<'d> Host<'d> {
                     self.restart = true;
                 }
             }
+            HostCommand::ProxyEnable { generation } => {
+                if generation != self.delivery.proxy.status().generation {
+                    self.status();
+                } else if self.state == HostState::Ready {
+                    self.delivery
+                        .proxy
+                        .enable(generation, Instant::now().as_millis());
+                } else {
+                    self.delivery.proxy.fault(ProxyFault::Unsupported);
+                }
+            }
+            HostCommand::ProxyDisable => self.delivery.proxy.disable(),
             HostCommand::Stop => {
+                self.delivery.proxy.disable();
                 self.enabled = false;
                 self.lifecycle(HostState::Stopped);
                 self.restart = true;
@@ -277,6 +297,7 @@ impl<'d> Host<'d> {
                 self.vbus.set_low();
             }
             HostCommand::Reset => {
+                self.delivery.proxy.disable();
                 if self.enabled {
                     self.restart = true;
                 }
@@ -305,6 +326,10 @@ impl<'d> Host<'d> {
     }
 
     pub(super) fn service(&mut self) {
+        self.delivery.proxy.tick(Instant::now().as_millis());
+        if self.delivery.proxy.take_changed().is_some() {
+            self.delivery.proxy.snapshot();
+        }
         self.collect_delivery_failures();
 
         for _ in 0..4 {
@@ -649,6 +674,9 @@ impl<'d> Host<'d> {
         input: &mut [u8],
         deadline: Instant,
     ) -> Result<usize, UsbError> {
+        if !packet.valid_buffers(out.len(), input.len()) {
+            return Err(UsbError::Unsupported);
+        }
         // Only throttle at a packet-safe boundary. Never extend the transfer's
         // absolute deadline or wait indefinitely for a stopped M4. Reserve room
         // for context/payload without delaying an active channel's RX draining.
@@ -671,6 +699,7 @@ impl<'d> Host<'d> {
             && code != UsbError::Nak
             && self.enabled
             && !self.restart
+            && !self.proxy_transfer_cancelled()
         {
             self.save_failure(code);
             // Cleanup can fail after an otherwise recoverable STALL/NAK. Keep
@@ -714,7 +743,7 @@ impl<'d> Host<'d> {
         }
         loop {
             self.service();
-            if !self.enabled || self.restart {
+            if !self.enabled || self.restart || self.proxy_transfer_cancelled() {
                 return Err(UsbError::Controller);
             }
             if !self.connected() {
@@ -727,7 +756,7 @@ impl<'d> Host<'d> {
                 return Err(UsbError::Timeout);
             }
             self.halt().await?;
-            if !self.enabled || self.restart {
+            if !self.enabled || self.restart || self.proxy_transfer_cancelled() {
                 return Err(UsbError::Controller);
             }
             if !self.connected() {
@@ -735,6 +764,9 @@ impl<'d> Host<'d> {
             }
             if !incoming {
                 self.prepare_out(out.len(), deadline).await?;
+            }
+            if self.proxy_transfer_cancelled() {
+                return Err(UsbError::Controller);
             }
             self.failure_snapshot = None;
             pac::USB_OTG_HS.hcint(0).write_value(regs::Hcint(0x7ff));
@@ -765,7 +797,7 @@ impl<'d> Host<'d> {
             let mut saw_data = false;
             let outcome = loop {
                 self.service();
-                if !self.enabled || self.restart {
+                if !self.enabled || self.restart || self.proxy_transfer_cancelled() {
                     break Err(UsbError::Controller);
                 }
                 if !self.connected() {
@@ -936,6 +968,49 @@ impl<'d> Host<'d> {
         Ok(total)
     }
 
+    fn proxy_transfer_cancelled(&self) -> bool {
+        self.proxy_transfer_generation.is_some_and(|generation| {
+            let status = self.delivery.proxy.status();
+            !status.enabled || !status.ready || status.generation != generation
+        })
+    }
+
+    /// Host-to-device class writes, including keyboard LED SET_REPORT. SETUP is
+    /// always SETUP PID, the first data packet DATA1, and status is DATA1 IN.
+    async fn control_out(&mut self, setup: [u8; 8], data: &[u8]) -> Result<usize, UsbError> {
+        let packets = super::host_logic::ControlOut::new(setup, data.len(), self.mps)?;
+        self.clear_transfer_context();
+        self.setup = setup;
+        self.transfer_sequence = self.transfer_sequence.wrapping_add(1).max(1);
+        self.transfer_id = self.transfer_sequence;
+        self.stage = TransferStage::Setup;
+        let deadline = Instant::now() + Duration::from_millis(1000);
+        self.packet(Packet::control(0, 3, self.mps), &setup, &mut [], deadline)
+            .await?;
+        self.stage = TransferStage::Data;
+        for (range, pid) in packets {
+            let count = self
+                .packet(
+                    Packet::control(0, pid, self.mps),
+                    &data[range.clone()],
+                    &mut [],
+                    deadline,
+                )
+                .await?;
+            if count != range.len() {
+                return Err(UsbError::Transaction);
+            }
+        }
+        self.stage = TransferStage::Status;
+        let count = self
+            .packet(Packet::control(0x80, 2, self.mps), &[], &mut [], deadline)
+            .await?;
+        if count != 0 {
+            return Err(UsbError::Transaction);
+        }
+        Ok(data.len())
+    }
+
     async fn descriptor(
         &mut self,
         kind: u8,
@@ -1050,6 +1125,21 @@ impl<'d> Host<'d> {
             Instant::now() + Duration::from_secs(2),
         )
         .await?;
+        let keyboard = selected.proxy_support(1);
+        let mouse = selected.proxy_support(2);
+        self.proxy_keyboard = if keyboard == ProxySupport::Boot {
+            selected
+                .hid
+                .iter()
+                .find(|ep| ep.boot && ep.protocol == 1)
+                .map(|ep| ep.interface)
+        } else {
+            None
+        };
+        self.delivery.proxy.support(keyboard, mouse);
+        self.delivery
+            .proxy
+            .support_notice(selected.hid.iter().filter(|ep| !ep.boot).count() as u8);
         Ok(selected)
     }
 
@@ -1077,6 +1167,28 @@ impl<'d> Host<'d> {
         let mut recoveries = [0u8; 4];
         let mut buffer = [0; 64];
         loop {
+            if let Some((generation, bits)) = self.delivery.proxy.take_leds()
+                && let Some(interface) = self.proxy_keyboard
+                && self.delivery.proxy.status().ready
+            {
+                self.proxy_transfer_generation = Some(generation);
+                let result = self
+                    .control_out(super::host_logic::led_setup(interface), &[bits])
+                    .await;
+                self.proxy_transfer_generation = None;
+                let current = self.delivery.proxy.status().generation == generation;
+                // Cancellation/session changes cannot attribute an old LED failure
+                // to a newly enabled generation.
+                if result.is_err() && current {
+                    self.emit_failure();
+                    self.delivery.proxy.led_failed();
+                }
+                if result == Err(UsbError::Disconnected)
+                    || (current && result == Err(UsbError::Controller))
+                {
+                    result?;
+                }
+            }
             if let Some(command) = self.storage_commands.pop_front() {
                 if let Some(storage) = &mut storage {
                     storage.handle(self, command).await?;
@@ -1094,6 +1206,7 @@ impl<'d> Host<'d> {
                 }
                 next[i] = Instant::now() + Duration::from_millis(u64::from(endpoint.interval));
                 let deadline = Instant::now() + Duration::from_millis(20);
+                let proxy = self.delivery.proxy.status();
                 match self
                     .packet(
                         Packet {
@@ -1110,6 +1223,21 @@ impl<'d> Host<'d> {
                 {
                     Ok(count) => {
                         toggles[i] ^= 2;
+                        if endpoint.boot
+                            && proxy.ready
+                            && self.delivery.proxy.status().generation == proxy.generation
+                        {
+                            let kind = if endpoint.protocol == 1 {
+                                BootKind::Keyboard
+                            } else {
+                                BootKind::Mouse
+                            };
+                            self.delivery.proxy.report(
+                                kind,
+                                &buffer[..count],
+                                Instant::now().as_millis(),
+                            );
+                        }
                         self.emit(UsbEvent::HidReport {
                             endpoint: endpoint.endpoint,
                             data: Vec::from_slice(&buffer[..count])
@@ -1249,6 +1377,10 @@ impl<'d> Host<'d> {
     }
 
     fn detached(&mut self) {
+        if self.attached {
+            self.delivery.proxy.session(self.session_id);
+            self.proxy_keyboard = None;
+        }
         self.clear_transfer_context();
         self.storage_commands.clear();
         if self.attached {
@@ -1355,6 +1487,7 @@ impl<'d> Host<'d> {
                         self.low = (pac::USB_OTG_HS.hprt().read().0 >> 17) & 3 == 2;
                         self.attached = true;
                         self.session_id = self.session_id.wrapping_add(1).max(1);
+                        self.delivery.proxy.session(self.session_id);
                         self.clear_transfer_context();
                         self.lifecycle(HostState::Attached);
                         self.emit(UsbEvent::Attached {

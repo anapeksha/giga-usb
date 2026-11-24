@@ -112,11 +112,29 @@ async fn ipc_task(
             if incoming.is_none() {
                 match ipc.try_receive() {
                     Ok(Some(message)) if message.event == Event::Ui => bus.receive(&message),
+                    Ok(Some(message)) if message.event == Event::Proxy => {
+                        match message.decode::<shared::usb::proxy::ProxyToHost>() {
+                            Ok(frame) => {
+                                if matches!(frame, shared::usb::proxy::ProxyToHost::Output { .. }) {
+                                    delivery.cancel_proxy_enable();
+                                    bus.cancel_proxy_enable();
+                                }
+                                delivery.proxy.feedback(frame);
+                            }
+                            Err(_) => delivery.note_transport_error(),
+                        }
+                    }
                     Ok(Some(message)) => incoming = delivery.incoming.push_back(message).err(),
                     Ok(None) => {}
                     Err(_) => delivery.note_transport_error(),
                 }
             }
+            pending.discard_if(|message| {
+                message.event == Event::Proxy
+                    && message
+                        .decode::<shared::usb::proxy::HostToProxy>()
+                        .is_ok_and(|frame| frame.generation() != delivery.proxy.status().generation)
+            });
             delivery.fill_pending(&mut pending);
             let event = pending.event();
             if pending.retry(|message| ipc.try_send(message)).is_err() {

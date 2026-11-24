@@ -22,6 +22,10 @@ import { Tooltip, TooltipTrigger, TooltipContent } from './components/ui/tooltip
 export default function App() {
   const http = createHttpController();
   const state = http.snapshot;
+  const proxySnapshot = () => {
+    state();
+    return http.proxyStatus();
+  };
   const commands: { command: Command; label: string }[] = [
     { command: 'start', label: 'Start' },
     { command: 'stop', label: 'Stop' },
@@ -156,6 +160,118 @@ export default function App() {
           {http.notice().message}
         </Callout>
       </Show>
+      <Card class="my-5">
+        <CardContent class="p-5">
+          <h2 class="text-base font-semibold">Keyboard & mouse proxy</h2>
+          <p class="mt-2 text-sm text-muted-foreground">
+            Forward supported keyboards and mice to the USB-C computer. Off by default.
+          </p>
+          <p class="mt-2 text-sm text-muted-foreground">
+            Active proxy, not passive capture. Dashboard disconnect does not stop forwarding.
+          </p>
+          <div class="my-3 flex flex-wrap gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={
+                !http.connected() ||
+                http.isPending() ||
+                http.downloading() ||
+                !http.hostReady() ||
+                !http.proxyStatus()?.output_connected ||
+                http.proxyStatus()?.enabled ||
+                ![http.proxyStatus()?.keyboard, http.proxyStatus()?.mouse].includes('boot') ||
+                [http.proxyStatus()?.keyboard, http.proxyStatus()?.mouse].some(
+                  (support) => support === 'unsupported' || support === 'ambiguous',
+                )
+              }
+              loading={
+                http.isPending() &&
+                (() => {
+                  const pending = http.pendingCommand();
+                  return typeof pending === 'object' && 'proxy_enable' in pending;
+                })()
+              }
+              onClick={() => {
+                const proxy = http.proxyStatus();
+                if (proxy) void http.command({ proxy_enable: { generation: proxy.generation } });
+              }}
+            >
+              Enable proxy
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={!http.connected() || http.isPending()}
+              loading={http.isPending() && http.pendingCommand() === 'proxy_disable'}
+              onClick={() => void http.command('proxy_disable')}
+            >
+              Disable proxy
+            </Button>
+          </div>
+          <p class="text-sm text-muted-foreground">Wait for Ready before testing.</p>
+          <Suspense fallback={<p role="status">Loading proxy status…</p>}>
+            <Show when={proxySnapshot()} fallback={<p class="mt-3">No proxy status reported</p>}>
+              {(proxy) => (
+                <dl class="status-grid" aria-label="Proxy status">
+                  <div>
+                    <dt>Forwarding</dt>
+                    <dd>
+                      {proxy().enabled
+                        ? proxy().ready
+                          ? 'Ready'
+                          : 'Enabled · not ready'
+                        : 'Disabled'}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>USB-C output</dt>
+                    <dd>{proxy().output_connected ? 'Available' : 'Disconnected or suspended'}</dd>
+                  </div>
+                  <div>
+                    <dt>Keyboard</dt>
+                    <dd>{proxy().keyboard === 'boot' ? 'Supported' : proxy().keyboard}</dd>
+                  </div>
+                  <div>
+                    <dt>Mouse</dt>
+                    <dd>{proxy().mouse === 'boot' ? 'Supported' : proxy().mouse}</dd>
+                  </div>
+                  <div>
+                    <dt>Input release</dt>
+                    <dd>
+                      <Show
+                        when={proxy().release !== 'failed'}
+                        fallback={
+                          <Callout variant="error" role="alert">
+                            <p>Input release unconfirmed</p>
+                            <p>
+                              Reset or power-cycle the board to restore USB-C. Reset USB won’t help.
+                            </p>
+                          </Callout>
+                        }
+                      >
+                        {proxy().release === 'released'
+                          ? 'Input release confirmed'
+                          : 'Waiting for input release confirmation'}
+                      </Show>
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Fault</dt>
+                    <dd>{proxy().fault.replaceAll('_', ' ')}</dd>
+                  </div>
+                  <div>
+                    <dt>Faults / rejected reports / LED failures</dt>
+                    <dd>
+                      {proxy().faults} / {proxy().rejected_reports} / {proxy().led_failures}
+                    </dd>
+                  </div>
+                </dl>
+              )}
+            </Show>
+          </Suspense>
+        </CardContent>
+      </Card>
       <Toaster theme="dark" />
       <section
         aria-label="Trace counters"

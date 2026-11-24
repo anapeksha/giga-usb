@@ -4,7 +4,7 @@
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
 use embassy_stm32::{
-    Peripherals, bind_interrupts,
+    Peripherals, bind_interrupts, pac,
     peripherals::USB_OTG_FS,
     usb::{Config as OtgConfig, Driver, InterruptHandler},
 };
@@ -19,19 +19,26 @@ use m4::ui_bus::Bus;
 use shared::usb::types::*;
 use static_cell::StaticCell;
 
-type UsbDriver = Driver<'static, USB_OTG_FS>;
+pub(crate) type UsbDriver = Driver<'static, USB_OTG_FS>;
 bind_interrupts!(struct Irqs { OTG_FS => InterruptHandler<USB_OTG_FS>; });
 
-pub fn start(spawner: Spawner, p: Peripherals, bus: &'static Bus) {
+pub fn start(
+    spawner: Spawner,
+    p: Peripherals,
+    bus: &'static Bus,
+    proxy: &'static m4::proxy::Proxy,
+) {
     static OUT: StaticCell<[u8; 256]> = StaticCell::new();
-    static CONFIG: StaticCell<[u8; 256]> = StaticCell::new();
+    static CONFIG: StaticCell<[u8; 512]> = StaticCell::new();
     static BOS: StaticCell<[u8; 256]> = StaticCell::new();
     static CONTROL: StaticCell<[u8; 64]> = StaticCell::new();
     static STATE: StaticCell<State<'static>> = StaticCell::new();
     let mut otg = OtgConfig::default();
     otg.vbus_detection = false;
     let driver = Driver::new_fs(p.USB_OTG_FS, Irqs, p.PA12, p.PA11, OUT.init([0; 256]), otg);
-    // Development identity only; obtain an allocated VID/PID before production.
+    // Keep the existing development identity for the composite functions, never
+    // copy the attached physical device's identity. Obtain an allocated VID/PID
+    // before production. CDC stays first (interfaces 0/1), HID follows (2/3).
     let mut config = Config::new(0x1209, 0x0001);
     config.manufacturer = Some("GigaUSB");
     config.product = Some("GigaUSB Diagnostics");
@@ -39,33 +46,96 @@ pub fn start(spawner: Spawner, p: Peripherals, bus: &'static Bus) {
     let mut builder = Builder::new(
         driver,
         config,
-        CONFIG.init([0; 256]),
+        CONFIG.init([0; 512]),
         BOS.init([0; 256]),
         &mut [],
         CONTROL.init([0; 64]),
     );
     let class = CdcAcmClass::new(&mut builder, STATE.init(State::new()), 64);
     let (sender, receiver, control) = class.split_with_control();
-    spawner.spawn(control_task(control, bus).unwrap());
-    spawner.spawn(usb_task(builder.build()).unwrap());
-    spawner.spawn(rx_task(receiver, bus).unwrap());
-    spawner.spawn(tx_task(sender, bus).unwrap());
+    let output = crate::hid_transport::add(&mut builder, proxy);
+    spawner.spawn(
+        usb_task(
+            builder.build(),
+            output,
+            sender,
+            receiver,
+            control,
+            bus,
+            proxy,
+        )
+        .unwrap(),
+    );
 }
 #[embassy_executor::task]
-async fn usb_task(mut device: UsbDevice<'static, UsbDriver>) {
-    device.run().await
+async fn usb_task(
+    mut device: UsbDevice<'static, UsbDriver>,
+    mut output: crate::hid_transport::Output,
+    mut tx: Sender<'static, UsbDriver>,
+    mut rx: Receiver<'static, UsbDriver>,
+    control: ControlChanged<'static>,
+    bus: &'static Bus,
+    proxy: &'static m4::proxy::Proxy,
+) {
+    static JSON: StaticCell<[u8; 2048]> = StaticCell::new();
+    let json = JSON.init([0; 2048]);
+    // This is intentionally a single-use service, not a recovery loop. Dropping
+    // the select cancels every device/endpoint future before lifecycle writes.
+    // CDC futures are independently polled during normal HID operation.
+    let _ = select(
+        device.run(),
+        select(
+            output.run(proxy),
+            embassy_futures::join::join3(
+                control_task(&control, bus),
+                rx_task(&mut rx, bus, proxy),
+                tx_task(&mut tx, bus, proxy, json),
+            ),
+        ),
+    )
+    .await;
+    proxy.output_failed();
+    bus.connection(false);
+    bus.cancel_proxy_enable();
+    // Embassy 0.6's OTG disable is a no-op at the hardware boundary. Soft
+    // disconnect explicitly, with all device/endpoint futures already stopped.
+    pac::USB_OTG_FS.dctl().modify(|w| w.set_sdis(true));
+    device.disable().await;
+    // The locked STM32H7 OTG_FS instance has nine endpoint slots. Deactivate
+    // them without a FIFO flush or hardware wait while physically disconnected.
+    for index in 1..9 {
+        pac::USB_OTG_FS.diepctl(index).modify(|w| {
+            w.set_snak(true);
+            if w.epena() {
+                w.set_epdis(true);
+            }
+            w.set_usbaep(false);
+        });
+        pac::USB_OTG_FS.doepctl(index).modify(|w| {
+            w.set_snak(true);
+            if w.epena() {
+                w.set_epdis(true);
+            }
+            w.set_usbaep(false);
+        });
+    }
+    bus.error(
+        "USB-C output fault: reset/power-cycle the board; USB host Reset cannot recover USB-C",
+    );
+    // Never poll/read/reopen the old driver: bus reset does not clear its private
+    // buffered OUT/SETUP state. Only a full board reset clears the BSS-owned
+    // driver state and terminal latch. HTTP/IPC remain live on their own tasks.
+    core::future::pending::<()>().await;
 }
 
-#[embassy_executor::task]
-async fn control_task(control: ControlChanged<'static>, bus: &'static Bus) {
+async fn control_task(control: &ControlChanged<'static>, bus: &Bus) {
     loop {
         bus.connection(control.dtr());
         control.control_changed().await;
     }
 }
 
-#[embassy_executor::task]
-async fn rx_task(mut rx: Receiver<'static, UsbDriver>, bus: &'static Bus) {
+async fn rx_task(rx: &mut Receiver<'static, UsbDriver>, bus: &Bus, proxy: &m4::proxy::Proxy) {
     let mut packet = [0; 64];
     let mut line = Vec::<u8, 128>::new();
     loop {
@@ -74,6 +144,12 @@ async fn rx_task(mut rx: Receiver<'static, UsbDriver>, bus: &'static Bus) {
         let mut oversize = false;
         let mut generation = bus.generation();
         loop {
+            let Some(epoch) = proxy.io_epoch() else {
+                line.clear();
+                oversize = false;
+                Timer::after_millis(1).await;
+                continue;
+            };
             if !rx.dtr() {
                 bus.connection(false);
                 line.clear();
@@ -81,6 +157,11 @@ async fn rx_task(mut rx: Receiver<'static, UsbDriver>, bus: &'static Bus) {
             }
             match select(rx.read_packet(&mut packet), Timer::after_millis(20)).await {
                 Either::First(Ok(n)) => {
+                    if !proxy.io_valid(epoch) {
+                        line.clear();
+                        oversize = false;
+                        continue;
+                    }
                     if generation != bus.generation() {
                         generation = bus.generation();
                         line.clear();
@@ -98,8 +179,9 @@ async fn rx_task(mut rx: Receiver<'static, UsbDriver>, bus: &'static Bus) {
                                     Ok((request, used))
                                         if line[used..].iter().all(u8::is_ascii_whitespace) =>
                                     {
-                                        let accepted = bus.accept_command(request.command).is_ok();
-                                        if !accepted {
+                                        if !proxy.command_allowed(request.command) {
+                                            bus.error("Stale proxy enable; request status and explicitly enable again");
+                                        } else if bus.accept_command(request.command).is_err() {
                                             bus.error("Busy: command queue full");
                                         }
                                     }
@@ -125,13 +207,19 @@ async fn rx_task(mut rx: Receiver<'static, UsbDriver>, bus: &'static Bus) {
     }
 }
 
-#[embassy_executor::task]
-async fn tx_task(mut tx: Sender<'static, UsbDriver>, bus: &'static Bus) {
-    static JSON: StaticCell<[u8; 2048]> = StaticCell::new();
-    let json = JSON.init([0; 2048]);
+async fn tx_task(
+    tx: &mut Sender<'static, UsbDriver>,
+    bus: &Bus,
+    proxy: &m4::proxy::Proxy,
+    json: &mut [u8; 2048],
+) {
     loop {
         tx.wait_connection().await;
         loop {
+            let Some(epoch) = proxy.io_epoch() else {
+                Timer::after_millis(1).await;
+                continue;
+            };
             bus.connection(tx.dtr());
             if !tx.dtr() {
                 Timer::after_millis(10).await;
@@ -154,7 +242,7 @@ async fn tx_task(mut tx: Sender<'static, UsbDriver>, bus: &'static Bus) {
             let generation = bus.generation();
             let write = async {
                 for chunk in json[..n + 2].chunks(64) {
-                    if !tx.dtr() || generation != bus.generation() {
+                    if !tx.dtr() || generation != bus.generation() || !proxy.io_valid(epoch) {
                         return Err(EndpointError::Disabled);
                     }
                     tx.write_packet(chunk).await?;
