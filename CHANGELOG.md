@@ -9,6 +9,8 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- SolidJS FAT32 root file browser with keyboard-accessible collapse, file sizes
+  and read-only downloads; unsupported folders and oversized files stay disabled.
 - Isolated Cargo `loader` tooling under `firmware/loader`, alongside both cores
   and shared, with default read-only behavior and a
   separately opted-in, range-limited programming qualification build. Mass erase

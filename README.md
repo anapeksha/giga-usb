@@ -253,8 +253,10 @@ to board. Search is limited to 96 UTF-8 bytes. Optional columns and expandable
 records expose transfer details; identification is a likely ID/class match or
 reported storage text, not authenticated make/model detection.
 
-Supported FAT32 drives can be listed and files downloaded read-only (root 8.3
-aliases, up to 32 entries, files up to 64 KiB). No writing or formatting is supported.
+Supported FAT32 drives appear in a collapsible root file browser with file sizes
+and read-only downloads (8.3 aliases, up to 32 entries, files up to 64 KiB).
+Folders are shown but cannot be opened; files above the limit cannot be downloaded.
+No writing or formatting is supported.
 **Request queued** means acceptance, not execution; completion arrives through events.
 A single SSE stream reconnects transient failures with processed cursors; a continuity
 reset clears stale board state. For connection problems, LED meanings, detailed
