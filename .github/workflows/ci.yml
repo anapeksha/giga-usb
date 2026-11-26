@@ -43,7 +43,25 @@ jobs:
           rustfmt --edition 2024 --check firmware/m7/installer/loader.rs
           rustc --edition 2024 --test -D warnings firmware/m7/installer/loader.rs -o target/installer-loader-tests
           target/installer-loader-tests
-          node web/src/installer/build.ts loader target/ci-installer-loader
+
+      - name: Test and check external loader natively (no hardware)
+        run: |
+          cargo test -p loader --target x86_64-unknown-linux-gnu --locked
+          cargo clippy -p loader --target x86_64-unknown-linux-gnu --all-targets --locked -- -D warnings
+          cargo test -p loader --target x86_64-unknown-linux-gnu --features programming --locked
+          cargo clippy -p loader --target x86_64-unknown-linux-gnu --all-targets --features programming --locked -- -D warnings
+      - name: Check and build external loader (no hardware)
+        run: |
+          cargo clippy -p loader --target thumbv7em-none-eabihf --release --locked -- -D warnings
+          cargo build -p loader --target thumbv7em-none-eabihf --release --locked
+          cargo clippy -p loader --target thumbv7em-none-eabihf --release --features programming --locked -- -D warnings
+          cargo build -p loader --target thumbv7em-none-eabihf --release --features programming --locked
+
+      - name: Test M7 OTA build settings (no hardware)
+        run: |
+          mkdir -p target
+          rustc --edition 2024 --test -D warnings firmware/m7/build.rs -o target/m7-build-tests
+          target/m7-build-tests
       - name: Test native libraries
         run: |
           cargo test -p shared --target x86_64-unknown-linux-gnu --lib --locked

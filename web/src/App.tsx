@@ -1,4 +1,6 @@
 import { For, Show, Suspense } from 'solid-js';
+import { FirmwareUpdate } from './components/firmware-update';
+import { StorageFileTree } from './components/storage-file-tree';
 import usbIdsLicense from '../../USB-IDS-LICENSE.txt?raw';
 import {
   Accordion,
@@ -57,6 +59,7 @@ export default function App() {
           </Tooltip>
         </div>
       </header>
+      <FirmwareUpdate connected={http.connected} sessionAbortSignal={http.sessionAbortSignal} />
 
       <Card>
         <CardContent class="p-5">
@@ -399,31 +402,19 @@ export default function App() {
                     {state().storageError}
                   </Callout>
                 </Show>
-                <For each={state().files}>
-                  {(file) => (
-                    <div class="flex flex-wrap items-center justify-between gap-3 py-2 break-all">
-                      <span>
-                        {file.name} ·{' '}
-                        {file.directory ? 'Folder' : `${file.size.toLocaleString()} bytes`}
-                      </span>
-                      <Button
-                        variant="outline"
-                        aria-label={`Download ${file.name}`}
-                        loading={http.downloading() && http.downloadingFile() === file.index}
-                        disabled={
-                          file.directory ||
-                          !state().attached ||
-                          !http.connected() ||
-                          http.downloading() ||
-                          http.isPending()
-                        }
-                        onClick={() => http.download(file)}
-                      >
-                        Download
-                      </Button>
-                    </div>
-                  )}
-                </For>
+                <Show when={storage().fat32}>
+                  <StorageFileTree
+                    files={state().files}
+                    disabled={
+                      !state().attached ||
+                      !http.connected() ||
+                      http.downloading() ||
+                      http.isPending()
+                    }
+                    downloadingFile={http.downloading() ? (http.downloadingFile() ?? null) : null}
+                    onDownload={http.download}
+                  />
+                </Show>
               </CardContent>
             </Card>
           )}

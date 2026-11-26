@@ -406,6 +406,59 @@ test('storage downloads 301 bytes in ordered 128-byte chunks with matching SHA-2
   );
 });
 
+test('FAT32 file tree is keyboard collapsible and keeps unsupported entries read-only', async ({
+  page,
+  api,
+  appURL,
+}) => {
+  api.emit({ type: 'host', event: { attached: { speed: 'full' } } });
+  api.emit({
+    type: 'host',
+    event: {
+      storage: { vendor: 'Fixture', product: 'FAT32', blocks: 1024, block_size: 512, fat32: true },
+    },
+  });
+  api.onCommand = (command) => {
+    if (command !== 'storage_list') return;
+    for (const file of [
+      { index: 0, name: '<b>.TXT', size: 0, directory: false },
+      { index: 1, name: 'DOCS', size: 0, directory: true },
+      { index: 2, name: 'LARGE.BIN', size: 65537, directory: false },
+      { index: 3, name: 'LIMIT.BIN', size: 65536, directory: false },
+    ])
+      api.emit({ type: 'host', event: { file } });
+  };
+  await page.setViewportSize({ width: 320, height: 800 });
+  await page.goto(appURL);
+  const root = page.getByRole('button', { name: 'FAT32 root', exact: true });
+  await expect(root).toHaveAttribute('aria-expanded', 'true');
+  await page.getByRole('button', { name: 'List files', exact: true }).click();
+  const files = page.getByRole('list', { name: 'Root files', exact: true });
+  await expect(files.getByRole('button', { name: 'Download <b>.TXT', exact: true })).toBeEnabled();
+  await expect(files.locator('b')).toHaveCount(0);
+  await expect(
+    files.getByRole('button', { name: 'Folder DOCS, unavailable', exact: true }),
+  ).toBeDisabled();
+  await expect(
+    files.getByRole('button', { name: 'Download LARGE.BIN', exact: true }),
+  ).toBeDisabled();
+  await expect(
+    files.getByRole('button', { name: 'Download LIMIT.BIN', exact: true }),
+  ).toBeEnabled();
+  const commands = api.commands.length;
+  await root.focus();
+  await page.keyboard.press('Space');
+  await expect(root).toHaveAttribute('aria-expanded', 'false');
+  await expect(files).not.toBeVisible();
+  await page.keyboard.press('Space');
+  await expect(files).toBeVisible();
+  expect(api.commands).toHaveLength(commands);
+  expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(
+    true,
+  );
+});
+
 test('malformed responses show actionable errors and remain accessible', async ({
   page,
   api,

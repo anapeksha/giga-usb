@@ -25,7 +25,7 @@
   },
   "data": { "address": "0x24012000", "capacity": 450560 },
   "operations": { "READ": 1, "PROGRAM_SECTOR": 2, "FINALIZE_HEADER": 3 },
-  "limits": { "read_max": 262144, "sector_size": 4096, "header_size": 32, "flash_size": 16777216, "write_start": "0xF00000", "write_end_exclusive": "0x1000000" },
+  "limits": { "read_max": 262144, "sector_size": 4096, "header_size": 32, "flash_size": 16777216, "write_ranges": [["0x200000", "0x240000"], ["0xE00000", "0x1000000"]], "finalize_header_offset": "0xF00000" },
   "states": { "running": 1, "success": 2, "error": 65535 },
   "phases": { "validation": 0, "erase": 1, "program": 2, "readback": 3, "complete": 4 },
   "errors": { "identity_sfdp": 1, "status_protection": 2, "wip_cycle_timeout": 3, "wip_poll_limit": 4, "write_enable": 5, "post_write_status": 6, "request": 7, "input_crc": 8, "first_sector_header_not_ff": 9, "header_format": 10, "header_not_erased_or_gzip_magic": 11, "erase_compare": 12, "program_compare": 13, "panic": 14, "environment": 15 },

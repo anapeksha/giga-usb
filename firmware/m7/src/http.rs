@@ -112,7 +112,7 @@ impl EventSource for Stream<'_> {
     }
 }
 
-struct Events<'a>(&'a str);
+pub(crate) struct Events<'a>(pub(crate) &'a str);
 
 impl Content for Events<'_> {
     fn content_type(&self) -> &'static str {
@@ -134,6 +134,7 @@ struct HttpService<'a> {
     bus: &'a Bus,
     assets: &'static crate::assets::Assets,
     buffers: &'a Mutex<NoopRawMutex, PageBuffers>,
+    update: &'a Mutex<NoopRawMutex, [u8; 4096]>,
 }
 
 impl PathRouterService for HttpService<'_> {
@@ -146,6 +147,20 @@ impl PathRouterService for HttpService<'_> {
         response_writer: W,
     ) -> Result<picoserve::ResponseSent, W::Error> {
         let method = request.parts.method();
+        if path == "/api/update/status"
+            || path == "/api/update/authorize"
+            || path == "/api/update/begin"
+            || path == "/api/update/chunk"
+            || path == "/api/update/commit"
+            || path == "/api/update/cancel"
+        {
+            return crate::ota_http::UpdateService {
+                assets: self.assets,
+                buffer: self.update,
+            }
+            .call_request_handler_service(state, path, request, response_writer)
+            .await;
+        }
         if path == "/" && method == "GET" {
             return crate::assets::DashboardService(self.assets)
                 .call_request_handler_service(state, (), request, response_writer)
@@ -222,10 +237,13 @@ pub async fn serve(
     // Keep page storage outside picoserve's nested response futures.
     let buffers = Mutex::<NoopRawMutex, _>::new(PageBuffers::default());
     let buffers = &buffers;
+    let update = Mutex::<NoopRawMutex, _>::new([0; 4096]);
+    bus.http_started();
     let app = Router::from_service(HttpService {
         bus,
         assets,
         buffers,
+        update: &update,
     });
     let config = Config::new(Timeouts {
         start_read_request: Duration::from_secs(5),

@@ -113,7 +113,7 @@ pub async fn run(
         for _ in 0..3 {
             spawner.spawn(http::serve(stack, bus, assets).unwrap());
         }
-        join(net.run(), dhcp(stack)).await;
+        join(net.run(), dhcp(stack, bus)).await;
     };
     join(runner.run(), services).await;
 }
@@ -139,7 +139,7 @@ fn report_network(bus: &Bus, mac: &[u8; 6], mode: &str, ip: Option<Ipv4Addr>, er
     });
 }
 
-async fn dhcp(stack: Stack<'_>) {
+async fn dhcp(stack: Stack<'_>, bus: &Bus) {
     let ip = Ipv4Addr::new(192, 168, 4, 1);
     let config = DhcpConfigBuilder::<1>::new()
         .server_ip(ip)
@@ -152,5 +152,6 @@ async fn dhcp(stack: Stack<'_>) {
         .lease_time(3600)
         .build();
     let mut server: DhcpServer<32, 1> = DhcpServer::with_config(config);
+    bus.dhcp_started();
     server.run_with_callback(stack, |_| {}).await;
 }

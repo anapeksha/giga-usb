@@ -1,5 +1,6 @@
 import { createHash, createPublicKey, verify } from 'node:crypto';
 import { gunzipSync } from 'node:zlib';
+import { allocationRecord, journalSeed, verifyOta } from '../ota/format.ts';
 
 const LIMIT = 64 * 1024 * 1024;
 const REQUIRED = [
@@ -16,7 +17,16 @@ const REQUIRED = [
   'BUILD.txt',
   'SHA256SUMS',
 ];
+const OTA_MEMBERS = [
+  'bootloader.elf',
+  'ota-active.bin',
+  'ota-manifest.bin',
+  'ota-state.bin',
+  'ota-allocation.bin',
+  'ota-layout.json',
+];
 const OPTIONAL = [
+  ...OTA_MEMBERS,
   'qspi-loader.elf',
   'qspi-loader.json',
   'installer-runtime.mjs',
@@ -164,11 +174,24 @@ export interface ElfSegment {
   data: Buffer;
 }
 /** Only file-backed physical bytes are programming operations; BSS is never flashed. */
-export function parseElfSegments(elf: Buffer, core: 'm4' | 'm7' | 'loader'): ElfSegment[] {
-  need(['m4', 'm7', 'loader'].includes(core), 'Unknown ELF core');
+export type ElfCore = 'm4' | 'm7' | 'm7-ota' | 'bootloader' | 'loader';
+export function parseElfSegments(elf: Buffer, core: ElfCore): ElfSegment[] {
+  need(['m4', 'm7', 'm7-ota', 'bootloader', 'loader'].includes(core), 'Unknown ELF core');
   const loader = core === 'loader';
-  const base = loader ? 0x24000000 : core === 'm4' ? 0x08100000 : 0x08000000;
-  const top = base + (loader ? 0x10000 : 0x100000);
+  const base = loader
+    ? 0x24000000
+    : core === 'm4'
+      ? 0x08100000
+      : core === 'm7-ota'
+        ? 0x08020000
+        : 0x08000000;
+  const top = loader
+    ? base + 0x10000
+    : core === 'bootloader'
+      ? 0x08020000
+      : core === 'm4'
+        ? 0x08200000
+        : 0x08100000;
   const ram = core === 'm4' ? 0x30000000 : 0x24000000;
   const ramTop = ram + (core === 'm4' ? 0x20000 : 0x80000);
   need(
@@ -342,6 +365,81 @@ function dashboard(files: Map<string, Buffer>) {
   );
 }
 
+export interface OtaBootstrapLayout {
+  format: 'GIGAUSB-OTA-BOOTSTRAP-1';
+  layout: 1;
+  protocol: 10;
+  buildId: string;
+  publicKeyHex: string;
+}
+
+export function paddedElf(elf: Buffer, core: ElfCore, base: number, length: number) {
+  const result = Buffer.alloc(length, 255);
+  for (const segment of parseElfSegments(elf, core)) {
+    need(
+      segment.address >= base && segment.address + segment.data.length <= base + length,
+      'Padded ELF bounds',
+    );
+    segment.data.copy(result, segment.address - base);
+  }
+  return result;
+}
+
+function validateBootstrap(
+  files: Map<string, Buffer>,
+  pem: Buffer | string,
+): OtaBootstrapLayout | undefined {
+  const count = OTA_MEMBERS.filter((name) => files.has(name)).length;
+  if (!count) return;
+  need(count === OTA_MEMBERS.length, 'Incomplete OTA bootstrap profile');
+  const profile = json(files.get('ota-layout.json')!);
+  keys(profile, ['format', 'layout', 'protocol', 'buildId', 'publicKeyHex']);
+  const key = createPublicKey(pem);
+  const raw = key.export({ format: 'der', type: 'spki' }).subarray(-32);
+  need(
+    profile.format === 'GIGAUSB-OTA-BOOTSTRAP-1' &&
+      profile.layout === 1 &&
+      profile.protocol === 10 &&
+      typeof profile.buildId === 'string' &&
+      /^[A-Za-z0-9._-]{1,48}$/.test(profile.buildId) &&
+      profile.publicKeyHex === raw.toString('hex'),
+    'Invalid OTA layout or trusted key',
+  );
+  const manifest = files.get('ota-manifest.bin')!;
+  const active = files.get('ota-active.bin')!;
+  const dashboardImage = files.get('dashboard.qspi.bin')!;
+  need(manifest.length === 256 && active.length === 0x1e0000, 'OTA bootstrap image bounds');
+  verifyOta(Buffer.concat([manifest, active, dashboardImage]), pem);
+  const build = Buffer.alloc(48);
+  build.write(profile.buildId);
+  need(manifest.subarray(120, 168).equals(build), 'OTA build identity mismatch');
+
+  const expected = Buffer.concat([
+    paddedElf(files.get('m7.elf')!, 'm7-ota', 0x08020000, 0xe0000),
+    paddedElf(files.get('m4.elf')!, 'm4', 0x08100000, 0x100000),
+  ]);
+  need(active.equals(expected), 'OTA ACTIVE differs from original ELF bytes or FF gaps');
+  need(
+    manifest.subarray(104, 112).equals(active.subarray(0, 8)) &&
+      manifest.subarray(112, 120).equals(active.subarray(0xe0000, 0xe0008)) &&
+      active.readUInt32LE(0) === 0x24080000 &&
+      active.readUInt32LE(0xe0000) === 0x30020000,
+    'OTA manifest vectors',
+  );
+  const boot = paddedElf(files.get('bootloader.elf')!, 'bootloader', 0x08000000, 0x20000);
+  need(boot.readUInt32LE(0) === 0x24080000, 'Bootstrap stack vector');
+  const state = journalSeed();
+  need(
+    state.readUInt32LE(123) === 0x5453a227 && files.get('ota-state.bin')!.equals(state),
+    'OTA factory journal mismatch',
+  );
+  need(
+    files.get('ota-allocation.bin')!.equals(allocationRecord()),
+    'OTA allocation record mismatch',
+  );
+  return profile as unknown as OtaBootstrapLayout;
+}
+
 /** Offline authentication and validation only. No files are executed or written. */
 export function verifyDistribution(
   signed: Buffer,
@@ -350,6 +448,7 @@ export function verifyDistribution(
   files: Map<string, Buffer>;
   tag: string;
   commit: string;
+  layout?: OtaBootstrapLayout;
 } {
   const files = unpack(authenticatedPayload(signed, trustedPublicPem));
   const checksums = text(files.get('SHA256SUMS')!);
@@ -378,7 +477,8 @@ export function verifyDistribution(
   const tag = tags[0][1],
     commit = commits[0][1];
   parseElfSegments(files.get('m4.elf')!, 'm4');
-  parseElfSegments(files.get('m7.elf')!, 'm7');
+  const layout = validateBootstrap(files, trustedPublicPem);
+  parseElfSegments(files.get('m7.elf')!, layout ? 'm7-ota' : 'm7');
   dashboard(files);
   for (const [binary, manifest] of [
     ['qspi-loader.elf', 'qspi-loader.json'],
@@ -411,5 +511,5 @@ export function verifyDistribution(
       'Installer manifest',
     );
   }
-  return { files, tag, commit };
+  return { files, tag, commit, ...(layout ? { layout } : {}) };
 }
