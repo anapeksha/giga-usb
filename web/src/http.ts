@@ -377,6 +377,7 @@ export function createHttpController() {
         download.mutate({ file, current: session, usbSession: state.session });
     },
     connected,
+    sessionAbortSignal: () => session?.signal,
     busy: () => active() && !connected(),
     isLoading: () => active() && !connected(),
     isPending: () => command.isPending && command.variables?.current === session,

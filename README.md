@@ -9,6 +9,39 @@ passive USB sniffer**: external traffic, handshakes, CRCs and wire timing are no
 captured. Compatibility is bounded, and hardware validation remains partial;
 see [support limits and validation](AGENTS.md#usb-correctness-and-tracing).
 
+## Experimental local OTA
+
+This branch adds a persistent updater. **RC3 is not OTA-capable:** the first
+installation requires SWD and changes the M7 application address. Do not flash
+individual application ELFs from this branch over an RC3 installation.
+
+Build a paired local test set from the repository root:
+
+```sh
+node web/src/ota/local.ts --output /absolute/path/to/giga-usb/target/local-ota-ready --defmt
+```
+
+The output directory must be new. The command creates a **test-only** trust key,
+`giga-usb-ota-bootstrap-test.hex` for `bootstrap-test-a`, and an OTA file for
+`candidate-test-b`. Never publish the test private key or mix files from different
+runs; rebuilding a set creates a different trust anchor.
+
+Initial provisioning requires a separately validated external loader and procedure;
+none is supplied here. See the bootstrap requirements below. Only after provisioning:
+
+1. Connect a separate client to `GigaUSB`, open the dashboard and expand
+   **Firmware update**. Check status: `bootstrap-test-a` must be confirmed.
+2. Select `giga-usb-candidate-test-b.ota.bin` and start the upload. USB-A and proxy
+   forwarding stop during staging. Wait for verification, then choose
+   **Install and restart**.
+3. Rejoin the AP if necessary. Success requires **`candidate-test-b` and confirmed**,
+   not just HTTP acceptance or the appearance of the dashboard.
+
+The HEX is for initial SWD provisioning; the `.ota.bin` is for dashboard upload.
+Initial provisioning is **not power-fail-safe**. On-board boot, watchdog, OTA
+transfer and physical rollback remain **hardware-unvalidated**. Retain SWD recovery.
+See [OTA engineering details](AGENTS.md#local-ota-architecture).
+
 ## Build
 
 Requires stable Rust, the `thumbv7em-none-eabihf` target and Node.js 24 LTS.
@@ -20,15 +53,24 @@ cargo build -p m4 --release --features defmt --locked
 cargo build -p m7 --release --features defmt --locked
 ```
 
-Build each core separately; do not use `--workspace` or `--all-features` for
-firmware builds. See [engineering checks](AGENTS.md#builds-and-tooling) for full validation.
+The single Cargo workspace has four members: `firmware/m7`, `firmware/m4`,
+`firmware/shared` and `firmware/m7/external-loader` (package `external-loader`).
+Build each core and the standalone loader separately; do not use `--workspace`
+or `--all-features` for firmware builds. The M7 package also builds `bootloader`
+with its separate linker layout; that binary is not a workspace member. Normal builds use the pinned production public key; the local test builder
+explicitly compiles both images with its generated test key and build IDs.
+Cargo’s `OUT_DIR` holds build-generated Rust included at compile time. The public
+key and build ID are compiled into firmware; production firmware does not read
+runtime environment variables. No private key is embedded.
+See [engineering checks](AGENTS.md#builds-and-tooling) for full validation.
 
 ## External dashboard assets
 
 The web build produces `dist/index.html.gz`, `dist/dashboard.qspi.bin` and
-`dist/dashboard.qspi.bin.json`. The dashboard is not embedded in M7; UI-only
-updates require provisioning the external container, not rebuilding firmware.
-Without valid assets M7 serves a small HTTP 503 notice; diagnostics/API remain available.
+`dist/dashboard.qspi.bin.json`. The dashboard is not embedded in M7. In the OTA layout, two external slots retain
+old/new assets; signed release metadata binds each application image to its matching
+dashboard. Use the complete OTA bundle rather than replacing the live container.
+The bootloader fails closed if no authenticated firmware/assets pair exists.
 
 The container targets external offset `0xF00000`, not internal flash. Never pass
 it to a normal firmware download command. See [format and provisioning](AGENTS.md#external-dashboard-provisioning)
@@ -38,61 +80,102 @@ verified asset readback and firmware startup. On-board HTTP/browser validation
 remains pending; see the dated evidence in `AGENTS.md`. Future destructive updates
 require separate authorization.
 
-## Verified installer
+## Intel HEX bootstrap and recovery
 
-RC3 and later releases include one `giga-usb-TAG.installer.mjs` containing the signed
-firmware, dashboard and part-specific RAM loader. It runs on the **computer**;
-never pass this file or the signed container to a flash programmer as firmware.
-Runtime requirements are **Node.js 24+, STM32CubeProgrammer and an external SWD
-probe**, on macOS or Linux. Rust, imgtool and Internet access are not needed.
+The Node installer has been removed. Node 24 tools in `web/src/ota/` build
+offline artifacts only; they do not access the board. `build.ts bootstrap` emits
+`bootstrap.hex` and `BOOTSTRAP-WARNING.txt`; `local.ts` emits the test HEX named above.
 
-Use a trusted copy of the installer and obtain the public signing key through an
-independently trusted channel. A public key downloaded beside an untrusted file
-is not sufficient. Verification cannot authenticate bootstrap code already running.
+| HEX address | Contents |
+| --- | --- |
+| `0x08000000` | Bootloader, padded to 128 KiB with `0xFF` |
+| `0x08020000` | Combined ACTIVE, `0x1E0000` bytes (M7 and M4, padded) |
+| `0x90200000` | Factory state journal |
+| `0x90202000` | Allocation record |
+| `0x90220000` | Signed manifest (metadata A) |
+| `0x90F00000` | Dashboard container (slot A) |
 
-```sh
-# Verification only: no board access.
-node giga-usb-TAG.installer.mjs --key trusted-signing-public.pem
+External addresses mean **`0x90000000 + NOR offset`**, not initialized memory.
+**No validated compatible external loader is supplied.** Programming requires an
+actual-part- and board-routing-specific compatible loader validated separately.
+There is no safe flashing command provided here. HEX neither initializes QSPI nor
+checks existing allocations, takes backups, defines erase policy or guarantees
+header-last programming. Unrepresented bytes are **not** implicitly erased;
+slot B, metadata B and scratch are not populated by this HEX. Independently
+authenticate artifacts, establish allocation consent/backups and verify readback
+with a reviewed provisioning procedure before attempting board access.
 
-# Replace paths, probe serial and TAG with the actual values.
-node giga-usb-TAG.installer.mjs --key trusted-signing-public.pem --install \
-  --programmer /absolute/path/to/STM32_Programmer_CLI --probe STLINK_SERIAL \
-  --backup-dir /absolute/path/to/durable-backups --replace-dashboard
-```
+First provisioning is **not power-fail-safe**; retain an external SWD recovery
+path. It overwrites the Arduino bootloader. Do not mass erase or change option
+bytes, protection or OTP/security settings. Partial application ELF downloads do
+not establish a valid signed OTA installation. Historical RC3 installer results
+do not validate this HEX path.
 
-The installer authenticates all assets before board access, takes two matching
-full external-flash backups plus internal/option backups, programs only allocated
-dashboard sectors with the header last, installs **M4 then M7**, verifies readback
-and preservation, compares option settings, then system-resets. Identical assets
-are not rewritten. Arbitrary occupied external data is rejected. It never enables
-proxy forwarding or changes protection, option bytes or OTP/security areas.
+### Read-only external loader qualification candidate
 
-Failures retain evidence and attempt to halt instead of booting uncertain images.
-Do not blindly retry writes: inspect the saved recovery instructions. For an exact
-staged image only, `--resume-from /absolute/prior-install-directory` validates the
-prior backups and fresh flash before committing the header and finishing. It is
-not general rollback. Keep backups outside the repository on durable storage.
-
-The normal full-install and interrupted-header recovery paths passed on the
-current board using test-signed development images. This does not establish
-on-board HTTP rendering or HID forwarding, or validate a published release image.
-
-## Flash manually
-
-An external SWD probe is required. Read the
-[hardware setup and boot options](AGENTS.md#hardware-setup-and-debugging) first.
-**Flashing M7 overwrites the Arduino bootloader.** Release any debugger using the
-probe, then flash matching images in this order:
+`firmware/m7/external-loader/` is the standalone `external-loader` workspace
+package. Its unsafe hardware boundary is isolated from the applications, which
+continue to forbid unsafe code. From the repository root (native target below
+is for Apple silicon; use `x86_64-unknown-linux-gnu` on Linux):
 
 ```sh
-probe-rs download --chip STM32H747XI --speed 1000 target/thumbv7em-none-eabihf/release/m4
-probe-rs download --chip STM32H747XI --speed 1000 target/thumbv7em-none-eabihf/release/m7
-probe-rs reset --chip STM32H747XI
+cargo test -p external-loader --target aarch64-apple-darwin --locked
+cargo clippy -p external-loader --target aarch64-apple-darwin --all-targets --locked -- -D warnings
+cargo clippy -p external-loader --target thumbv7em-none-eabihf --release --locked -- -D warnings
+cargo build -p external-loader --target thumbv7em-none-eabihf --release --locked
+cp target/thumbv7em-none-eabihf/release/external-loader target/GIGA_AT25_READONLY_UNQUALIFIED.stldr
 ```
 
-Verify programming and use a full system reset. Routine updates use sector-scoped
-flashing, not mass erase. Recovery and CubeProgrammer instructions are in the
-[engineering guide](AGENTS.md#flash-log-and-debug).
+The package build script supplies loader-only linker flags on the Thumb target;
+native binary tests exclude all hardware code and native builds have a no-op
+entry point. The `.stldr` copy retains the ELF's symbols and load segments; do
+not use a raw objcopy binary. Record `rustc -Vv` for reproducibility; stable is
+a moving toolchain. These commands do not access hardware. No hardware
+qualification has run, and Write, SectorErase and MassErase still refuse all
+requests. This candidate cannot program the bootstrap HEX.
+
+ABI provenance:
+
+- Official [ST memory loaders](https://github.com/STMicroelectronics/stm32-memory-loaders/tree/c5e1ecba29d9a93cec5fbb76ff4bae8e46bea042),
+  commit `c5e1ecba29d9a93cec5fbb76ff4bae8e46bea042`: H747I-DISCO
+  `MT25TL01G` loader `Dev_Inf.h`, `Dev_Inf.c` and `Loader_Src.c` establish
+  metadata layout and callback conventions. Native/linker checks enforce the
+  200-byte metadata; `StorageInfo` is retained in `.Dev_Info`, with `Device_Info`
+  as an alias. No ST implementation is copied.
+- Official installed CubeProgrammer **2.24.0** SPI example
+  `bin/ExternalLoader/M25P64_STM3210E-EVAL.stldr`, SHA-256
+  `330444f0914f771397daf2f5a7aa1237a871cbe782a0bbefdeb6d1001a86249d`:
+  DWARF identifies `int Read(uint32_t Address, uint32_t Size, uint8_t *buffer)`
+  at `Sources/Loader_Files/Loader_Src.c:37`. Disassembly passes those arguments
+  to SPI command `03`, decrements Size per byte stored, and returns 1 on success.
+  This confirms the existing Rust Read signature and byte units.
+
+**Tool stack/buffer allocation remains unresolved.** The official SPI example
+uses the caller's stack, but does not establish its location. The official H7
+contrib linker example's `_estack`/stack reservation does not prove CubeProgrammer
+honors it. The inspected API header exposes no allocation contract. The candidate
+therefore retains its own restrictive policy: code/constants at
+`0x24000004..0x24010000`, buffers wholly in `0x24010000..0x24070000`, and a required
+valid 8-byte-aligned caller stack in `0x24070000..0x24080000`. These are prerequisites,
+not verified tool allocations; there is no startup, heap or data/BSS initialization.
+
+The hardware boundary was reviewed against `firmware/m7/installer/loader.rs`.
+Before GPIO access, Init/Read require privileged M7 thread/MSP, PRIMASK=1,
+M4 never released (BOOT_C2=0 and current BCM4=0), HSI ready/DIV1 and selected,
+canonical D1 dividers, caches/MPU disabled and QUADSPI clock gated. Caller must
+establish a reviewed reset/halt procedure, valid stack, and exclusion of other
+bus masters/watchdogs; checks alone do not establish these conditions. No safe
+board-invocation command is supplied.
+
+GPIO mode 0 uses PD11 MOSI, PD12 MISO, PE2/PF6 IO2/IO3 high, PF10 CLK and PG6 CS.
+Only `9F` (exact JEDEC `1f8901`), `05` (reject WIP/WEL) and bounded `03` reads
+are implemented; CS releases every 256 bytes. JEDEC is not full part/SFDP
+qualification. Write, SectorErase and MassErase always fail without hardware
+access: **no programming build or enable flag exists**. Verify/CheckSum are
+omitted; tool fallback support is unqualified. Timing, callback allocation,
+Init failure cases and independent readback against trusted backups still need
+qualification. This candidate cannot provision HEX or enforce image ordering;
+no erase, security/OTP or option-byte changes are authorized by it.
 
 ## Use
 

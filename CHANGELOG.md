@@ -7,7 +7,45 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Experimental local OTA updates through the dashboard using one signed `.ota.bin`,
+  bounded uploads, explicit install/restart and exact build-confirmation checks.
+- A persistent bootloader using Embassy's combined-image swap engine with an
+  H747-specific RAM-resident flash boundary, watchdog and M7/M4 trial rollback.
+- Transactional external boot-state records and hash-selected A/B dashboards,
+  retaining the previous core images, signed metadata and assets for rollback.
+- Offline Intel HEX bootstrap generation and a local A/B test-artifact builder.
+  Local test keys are separate from production signing and never embedded privately.
+
+### Changed
+
+- On the OTA branch, the bootloader owns the first 128 KiB; M7 starts at
+  `0x08020000`. M4 remains at `0x08100000`. Initial migration requires the full
+  Intel HEX bootstrap; partial RC3-style application flashing is not supported.
+- Updates quiesce USB-A/proxy output and reject new activation commands. The update
+  task owns flash operations independently of HTTP cancellation.
+- Removed the Node installer in favor of offline Intel HEX bootstrap artifacts.
+  Firmware public key/build ID are compiled through Cargo’s `OUT_DIR`, not read
+  from production runtime environment variables.
+- HEX external addresses use `0x90000000 + NOR offset`. No validated compatible
+  actual-part/board-routing-specific external loader or safe flashing command is
+  supplied. HEX provides no allocation, backup, erase-policy or header-last
+  guarantees; unrepresented bytes are not implicitly erased. First provisioning
+  is not power-fail-safe; retain SWD recovery and preserve option/security settings.
+
+### Validation and known limitations
+
+- Qualification currently consists of native fault models, compilation, browser
+  fixtures and offline artifact verification—not on-board OTA operation.
+- Initial migration, watchdog timing, physical rollback/power-cut recovery, upload
+  delivery and sustained USB/AP behavior remain hardware-unverified. Retain SWD
+  recovery and do not treat these experimental builds as a validated release.
+
 ## [v0.1.0-rc3] - 2026-11-24
+
+Historical RC3 release notes: the Node installer below has since been removed;
+its procedures and results do not apply to the current HEX bootstrap.
 
 Third release candidate, adding opt-in boot-HID forwarding and a single verified
 installer. This remains experimental firmware. Forwarding is disabled at boot;
@@ -67,7 +105,7 @@ installer verification alone does not access the board.
   STM32CubeProgrammer executable, probe serial and durable backup directory on
   macOS/Linux. No Rust compiler, imgtool or runtime Internet access is needed.
 - Run with `--key trusted-public.pem` for verification only. Add `--install` and
-  the required programmer/probe/backup arguments to install; see `README.md`.
+  the required programmer/probe/backup arguments to install (historical RC3 only).
 - The installer verifies the signed archive before board access, provisions the
   dashboard header last, flashes M4 then M7, and verifies readback and preservation
   before system reset. Existing unrelated data, option bytes and OTP/security

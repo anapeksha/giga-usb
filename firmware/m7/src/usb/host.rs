@@ -269,6 +269,17 @@ impl<'d> Host<'d> {
     }
 
     fn handle_command(&mut self, command: HostCommand, request_processor_snapshot: bool) {
+        // Enforce maintenance at execution as well as HTTP admission: CDC and
+        // previously buffered commands cannot bypass the update owner's latch.
+        if self.network.is_some_and(Bus::maintenance)
+            && matches!(
+                command,
+                HostCommand::Start | HostCommand::ProxyEnable { .. } | HostCommand::Reset
+            )
+        {
+            self.status();
+            return;
+        }
         match command {
             HostCommand::Start => {
                 if !self.enabled {

@@ -39,6 +39,7 @@ async fn ipc_task(
     proxy: &'static m4::proxy::Proxy,
 ) {
     let mut pending = shared::ipc_delivery::Pending::new();
+    let mut pong = None;
     let mut incoming_command = None;
     let mut command_turn = true;
     let mut proxy_turn = true;
@@ -102,11 +103,13 @@ async fn ipc_task(
                         }
                         Err(_) => bus.error("Malformed network command"),
                     },
-                    Event::Ping if pending.is_none() => {
-                        pending.set(Some(Message {
+                    Event::Ping => {
+                        // Retain the newest health challenge without replacing
+                        // an in-flight transport frame under backpressure.
+                        pong = Some(Message {
                             event: Event::Pong,
                             value: message.value,
-                        }));
+                        });
                     }
                     _ => {}
                 },
@@ -125,6 +128,9 @@ async fn ipc_task(
                     .is_ok_and(|command| !proxy.command_allowed(command))
         }) {
             bus.error("Stale proxy enable; request status and explicitly enable again");
+        }
+        if pending.is_none() && pong.is_some() {
+            pending.set(pong.take());
         }
         if pending.is_none()
             && proxy_turn

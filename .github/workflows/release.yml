@@ -54,6 +54,22 @@ jobs:
       - name: Build dashboard
         working-directory: web
         run: npm ci && npm run check
+      - name: Prepare OTA build identity
+        env:
+          PUBLIC_KEY: ${{ secrets.FIRMWARE_SIGNING_PUBLIC_KEY }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { createPublicKey } from 'node:crypto';
+          import { appendFileSync } from 'node:fs';
+          const key = createPublicKey(process.env.PUBLIC_KEY);
+          if (key.asymmetricKeyType !== 'ed25519') throw new Error('Ed25519 public key required');
+          const der = key.export({ format: 'der', type: 'spki' });
+          const hex = der.subarray(-32).toString('hex');
+          if (hex === '0'.repeat(64)) throw new Error('Zero public key');
+          const id = `git-${process.env.GITHUB_SHA}`;
+          if (!/^[A-Za-z0-9._-]{1,48}$/.test(id)) throw new Error('Invalid OTA build ID');
+          appendFileSync(process.env.GITHUB_ENV, `GIGAUSB_OTA_PUBLIC_KEY_HEX=${hex}\nGIGAUSB_OTA_BUILD_ID=${id}\n`);
+          NODE
       - name: Build matching firmware
         run: |
           rustup show active-toolchain
@@ -65,7 +81,7 @@ jobs:
       - name: Verify release logging is disabled
         shell: bash
         run: |
-          for core in m4 m7; do
+          for core in m4 m7 bootloader; do
             image="target/thumbv7em-none-eabihf/release/$core"
             readelf --sections --wide "$image" > "target/$core-release-sections.txt"
             readelf --symbols --wide "$image" > "target/$core-release-symbols.txt"
@@ -75,29 +91,9 @@ jobs:
               exit 1
             fi
           done
-      - name: Package release
-        shell: bash
-        run: |
-          mkdir -p target/release-package target/release-assets
-          cp target/thumbv7em-none-eabihf/release/m4 target/release-package/m4.elf
-          cp target/thumbv7em-none-eabihf/release/m7 target/release-package/m7.elf
-          cp dist/index.html.gz dist/dashboard.qspi.bin dist/dashboard.qspi.bin.json target/release-package/
-          cp README.md AGENTS.md USB-IDS-LICENSE.txt target/release-package/
-          cp LICENSE CHANGELOG.md target/release-package/
-          {
-            printf 'Tag: %s\nCommit: ' "$RELEASE_TAG"
-            git rev-parse HEAD
-            rustc --version
-            printf 'Features: none (defmt disabled)\nExternal dashboard assets required; read README.md and AGENTS.md provisioning instructions before deployment.\nFlash M4 then M7; verify and system-reset. M7 overwrites the Arduino bootloader.\n'
-          } > target/release-package/BUILD.txt
-          node web/src/installer/build.ts loader target/release-package
-          node web/src/installer/build.ts runtime target/release-package/installer-runtime.mjs
-          node web/src/installer/build.ts manifest target/release-package
-          (cd target/release-package && sha256sum m4.elf m7.elf index.html.gz dashboard.qspi.bin dashboard.qspi.bin.json README.md AGENTS.md USB-IDS-LICENSE.txt LICENSE CHANGELOG.md BUILD.txt qspi-loader.elf qspi-loader.json installer-runtime.mjs installer-manifest.json > SHA256SUMS)
-          tar -czf "target/release-assets/$ASSET_NAME.tar.gz" -C target/release-package .
       - name: Install signing tool
         run: python -m pip install --disable-pip-version-check imgtool==2.5.0
-      - name: Sign and verify distribution container
+      - name: Package OTA and sign distribution
         shell: bash
         env:
           SIGNING_KEY: ${{ secrets.FIRMWARE_SIGNING_KEY }}
@@ -110,7 +106,61 @@ jobs:
           test -n "$SIGNING_KEY" || { echo 'FIRMWARE_SIGNING_KEY is required.' >&2; exit 1; }
           test -n "$PUBLIC_KEY" || { echo 'FIRMWARE_SIGNING_PUBLIC_KEY is required.' >&2; exit 1; }
           printf '%s\n' "$SIGNING_KEY" > "$key"
+          unset SIGNING_KEY
+          mkdir -p target/release-assets
           printf '%s\n' "$PUBLIC_KEY" > "target/release-assets/$ASSET_NAME-public.pem"
+          node --input-type=module <<'NODE'
+          import { createPublicKey } from 'node:crypto';
+          import { readFileSync } from 'node:fs';
+          import { parseElfSegments } from './web/src/installer/verify.ts';
+          const publicKey = createPublicKey(process.env.PUBLIC_KEY);
+          const der = publicKey.export({ format: 'der', type: 'spki' });
+          const raw = der.subarray(-32);
+          const privatePublic = createPublicKey(readFileSync(`${process.env.RUNNER_TEMP}/firmware-signing.pem`));
+          if (!der.equals(privatePublic.export({ format: 'der', type: 'spki' })) ||
+              raw.toString('hex') !== process.env.GIGAUSB_OTA_PUBLIC_KEY_HEX) {
+            throw new Error('Signing key does not match compiled OTA trust anchor');
+          }
+          for (const [name, profile] of [['bootloader', 'bootloader'], ['m7', 'm7-ota']]) {
+            const elf = readFileSync(`target/thumbv7em-none-eabihf/release/${name}`);
+            const loaded = Buffer.concat(parseElfSegments(elf, profile).map(segment => segment.data));
+            if (!loaded.includes(raw)) throw new Error(`${name} lacks configured trust anchor`);
+            if (name === 'm7' && !loaded.includes(Buffer.from(process.env.GIGAUSB_OTA_BUILD_ID))) {
+              throw new Error('M7 lacks configured build ID');
+            }
+          }
+
+          NODE
+          node web/src/ota/build.ts bootstrap \
+            target/thumbv7em-none-eabihf/release/bootloader \
+            target/thumbv7em-none-eabihf/release/m7 \
+            target/thumbv7em-none-eabihf/release/m4 \
+            dist/dashboard.qspi.bin "$key" "$GIGAUSB_OTA_BUILD_ID" target/release-package
+          node web/src/ota/build.ts ota \
+            target/thumbv7em-none-eabihf/release/m7 \
+            target/thumbv7em-none-eabihf/release/m4 \
+            dist/dashboard.qspi.bin "$key" "$GIGAUSB_OTA_BUILD_ID" \
+            "target/release-assets/$ASSET_NAME.ota.bin"
+          node --input-type=module <<'NODE'
+          import { verifyOtaFile } from './web/src/ota/format.ts';
+          const manifest = verifyOtaFile(`target/release-assets/${process.env.ASSET_NAME}.ota.bin`, process.env.PUBLIC_KEY);
+          if (manifest.buildId !== process.env.GIGAUSB_OTA_BUILD_ID) throw new Error('OTA build ID mismatch');
+          NODE
+          cp dist/index.html.gz dist/dashboard.qspi.bin dist/dashboard.qspi.bin.json target/release-package/
+          cp README.md AGENTS.md USB-IDS-LICENSE.txt target/release-package/
+          cp LICENSE CHANGELOG.md target/release-package/
+          {
+            printf 'Tag: %s\nCommit: ' "$RELEASE_TAG"
+            git rev-parse HEAD
+            rustc --version
+            printf 'Features: none (defmt disabled)\nLayout: OTA-v1\nBuild ID: %s\n' "$GIGAUSB_OTA_BUILD_ID"
+            node --input-type=module -e 'import {createHash,createPublicKey} from "node:crypto"; console.log("Trust fingerprint (SHA256 SPKI DER): " + createHash("sha256").update(createPublicKey(process.env.PUBLIC_KEY).export({format:"der",type:"spki"})).digest("hex"));'
+            printf 'Experimental OTA bootstrap profile; read README.md and AGENTS.md before deployment.\nFirst installation uses bootstrap HEX and requires a separately validated external loader. No compatible loader is supplied.\nNever flash the distribution container or OTA candidate directly over SWD.\n'
+          } > target/release-package/BUILD.txt
+          cp target/release-package/bootstrap.hex "target/release-assets/$ASSET_NAME.hex"
+          (cd target/release-package && sha256sum *.elf *.bin *.json *.hex *.gz *.md *.txt LICENSE > SHA256SUMS)
+          tar -czf "target/release-assets/$ASSET_NAME.tar.gz" -C target/release-package .
+
           imgtool sign --key "$key" --version 0.0.0 \
             --header-size 0x200 --pad-header --align 4 --slot-size 0x4000000 \
             --non-bootable "target/release-assets/$ASSET_NAME.tar.gz" "target/release-assets/$ASSET_NAME.signed.bin"
@@ -118,17 +168,9 @@ jobs:
           dd if="target/release-assets/$ASSET_NAME.signed.bin" bs=1 skip=512 \
             count="$(wc -c < "target/release-assets/$ASSET_NAME.tar.gz")" status=none \
             | cmp - "target/release-assets/$ASSET_NAME.tar.gz"
-      - name: Build and verify standalone installer (no hardware)
-        shell: bash
+      - name: Checksum release assets
         run: |
-          node web/src/installer/build.ts package \
-            "target/release-assets/$ASSET_NAME.signed.bin" \
-            target/release-package/installer-runtime.mjs \
-            "target/release-assets/$ASSET_NAME-public.pem" \
-            "target/release-assets/$ASSET_NAME.installer.mjs"
-          node "target/release-assets/$ASSET_NAME.installer.mjs" \
-            --key "target/release-assets/$ASSET_NAME-public.pem"
-          (cd target/release-assets && sha256sum "$ASSET_NAME.tar.gz" "$ASSET_NAME.signed.bin" "$ASSET_NAME-public.pem" "$ASSET_NAME.installer.mjs" > "$ASSET_NAME-SHA256SUMS")
+          (cd target/release-assets && sha256sum *.tar.gz *.signed.bin *.hex *.ota.bin *-public.pem > "$ASSET_NAME-SHA256SUMS")
       - name: Upload release assets
         uses: softprops/action-gh-release@v3
         with:
@@ -140,6 +182,7 @@ jobs:
           files: |
             target/release-assets/${{ env.ASSET_NAME }}.tar.gz
             target/release-assets/${{ env.ASSET_NAME }}.signed.bin
-            target/release-assets/${{ env.ASSET_NAME }}.installer.mjs
+            target/release-assets/${{ env.ASSET_NAME }}.hex
+            target/release-assets/${{ env.ASSET_NAME }}.ota.bin
             target/release-assets/${{ env.ASSET_NAME }}-public.pem
             target/release-assets/${{ env.ASSET_NAME }}-SHA256SUMS

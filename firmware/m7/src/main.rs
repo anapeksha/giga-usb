@@ -6,6 +6,8 @@
 mod assets;
 mod http;
 mod network;
+mod ota;
+mod ota_http;
 mod status_led;
 
 #[cfg(feature = "defmt")]
@@ -39,6 +41,7 @@ async fn main(spawner: Spawner) {
     );
     static BUS: StaticCell<Bus> = StaticCell::new();
     let bus = BUS.init(Bus::new());
+    bus.set_maintenance(true);
     spawner.spawn(
         status_led::run(
             Output::new(p.PI12, Level::High, Speed::Low),
@@ -48,7 +51,10 @@ async fn main(spawner: Spawner) {
         )
         .unwrap(),
     );
-    let mut flash = assets::Flash {
+    static DELIVERY: StaticCell<m7::ipc_delivery::Delivery> = StaticCell::new();
+    let delivery = DELIVERY.init(m7::ipc_delivery::Delivery::new());
+    spawner.spawn(ipc_task(ipc, delivery, bus).unwrap());
+    let flash = assets::Flash {
         clock: Output::new(p.PF10, Level::Low, Speed::Low),
         select: Output::new(p.PG6, Level::High, Speed::Low),
         mosi: Output::new(p.PD11, Level::Low, Speed::Low),
@@ -56,18 +62,22 @@ async fn main(spawner: Spawner) {
         hold: Output::new(p.PF6, Level::High, Speed::Low),
         protect: Output::new(p.PE2, Level::High, Speed::Low),
     };
-    let header = embassy_time::with_timeout(embassy_time::Duration::from_secs(5), flash.validate())
-        .await
-        .ok()
-        .flatten();
-    if header.is_none() {
+    let mut assets = assets::Assets::new(flash);
+    // Non-feeding trial startup cap, not an IWDG timing proof. Hardware must
+    // qualify complete HAL + asset + network readiness against worst-case LSI;
+    // neither this cap nor progress callbacks authorize feeding an unconfirmed trial.
+    let valid = embassy_time::with_timeout(
+        embassy_time::Duration::from_secs(20),
+        assets.initialize(p.FLASH),
+    )
+    .await
+    .is_ok_and(|result| result.is_ok());
+    if !valid {
         logging::warn!("QSPI dashboard missing or invalid; HTTP recovery notice only");
     }
     static ASSETS: StaticCell<assets::Assets> = StaticCell::new();
-    let assets = ASSETS.init(assets::Assets {
-        flash: embassy_sync::mutex::Mutex::new(flash),
-        header,
-    });
+    let assets = ASSETS.init(assets);
+    spawner.spawn(ota::run(assets, bus, delivery).unwrap());
     spawner.spawn(
         network::run(
             network::Pins {
@@ -86,9 +96,6 @@ async fn main(spawner: Spawner) {
         )
         .unwrap(),
     );
-    static DELIVERY: StaticCell<m7::ipc_delivery::Delivery> = StaticCell::new();
-    let delivery = DELIVERY.init(m7::ipc_delivery::Delivery::new());
-    spawner.spawn(ipc_task(ipc, delivery, bus).unwrap());
     let mut host = Host::new(p.USB_OTG_HS, p.PB14, p.PB15, p.PA15, delivery).with_network(bus);
     host.run(|dropped| logging::warn!("USB capture dropped {} frames (cumulative)", dropped))
         .await;
@@ -112,6 +119,9 @@ async fn ipc_task(
             if incoming.is_none() {
                 match ipc.try_receive() {
                     Ok(Some(message)) if message.event == Event::Ui => bus.receive(&message),
+                    Ok(Some(message)) if message.event == Event::Pong => {
+                        bus.pong(&message, Instant::now().as_millis())
+                    }
                     Ok(Some(message)) if message.event == Event::Proxy => {
                         match message.decode::<shared::usb::proxy::ProxyToHost>() {
                             Ok(frame) => {

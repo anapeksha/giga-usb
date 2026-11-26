@@ -1,4 +1,5 @@
 import { For, Show, Suspense } from 'solid-js';
+import { FirmwareUpdate } from './components/firmware-update';
 import usbIdsLicense from '../../USB-IDS-LICENSE.txt?raw';
 import {
   Accordion,
@@ -57,6 +58,7 @@ export default function App() {
           </Tooltip>
         </div>
       </header>
+      <FirmwareUpdate connected={http.connected} sessionAbortSignal={http.sessionAbortSignal} />
 
       <Card>
         <CardContent class="p-5">

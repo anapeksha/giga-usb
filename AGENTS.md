@@ -13,8 +13,16 @@ handshakes, CRCs, bus timing and arbitrary external traffic are not captured.
 
 ## Workspace and ownership
 
-- Keep one Cargo workspace: `firmware/m7`, `firmware/m4`, `firmware/shared`.
-- M7 owns USB-A host control, scheduling, capture, Wi-Fi and HTTP.
+- Keep one four-member Cargo workspace: `firmware/m7`, `firmware/m4`,
+  `firmware/shared` and `firmware/m7/external-loader` (package `external-loader`).
+  The standalone external loader is the explicit tooling exception; its unsafe
+  boundary stays isolated and does not relax either application's unsafe forbid.
+  Its Write, SectorErase and MassErase callbacks must continue refusing requests
+  until programming is separately approved and qualified. Build/test it separately;
+  no hardware access is part of its software checks.
+- M7 owns USB-A host control, scheduling, capture, Wi-Fi, HTTP and OTA staging.
+  Its additional `bootloader` binary owns reset-time swap/authentication and the
+  first 128-KiB internal sector; it is a binary in M7, not a workspace member.
 - M4 owns descriptor/HID processing and USB-C composite CDC/boot-HID output.
   Active proxy forwarding is opt-in and disabled at boot; never enable it as a
   side effect of Start, reconnect, status refresh, or snapshot replay.
@@ -30,15 +38,19 @@ handshakes, CRCs, bus timing and arbitrary external traffic are not captured.
 - M7 owns USB_OTG_HS with its internal full-speed PHY, PB14/PB15, PA15 VBUS,
   SDMMC1, PB10, PC8–PC12/PD2, RGB LED PI12/PJ13/PE3 and TIM2.
 - M7 also exclusively owns external-flash GPIO SPI routing PD11/PD12/PE2/PF6/
-  PF10/PG6. Do not initialize QUADSPI concurrently. The current reader is read-only,
-  bounded and cooperative; do not substitute the BSP's unbounded blocking QSPI
-  transfers or wrap them in an ineffective async timeout.
+  PF10/PG6. Do not initialize QUADSPI concurrently. The OTA branch adds a bounded,
+  cooperative NOR writer owned by its dedicated update task; asset reads use the
+  same exclusive owner. Do not substitute unbounded BSP QSPI transfers or wrap
+  them in an ineffective async timeout.
 - M4 owns USB_OTG_FS, PA11/PA12 and TIM5. Never access one controller from both cores.
 - Embassy provides cooperative executors, timers, HAL support and USB device
   transport. `giga-r1` provides board Wi-Fi support, IPC queues and MPU setup.
 - Both applications forbid unsafe code. M7 uses safe typed PAC access rather
   than raw MMIO. Keep peripheral ownership explicit; do not move core-specific
   hardware access into shared.
+- The isolated `firmware/m7/src/bootloader` reset binary has a reviewed unsafe
+  boundary for RAM relocation, internal flashword writes and the application
+  handoff. Neither application's unsafe-code prohibition is relaxed.
 - Shared HAL metadata remains genuinely shared. Preserve its required linker
   attributes and the shared-memory reservations.
 
@@ -72,6 +84,10 @@ provenance, scoped lookup and license notices when updating. No runtime Internet
 ```sh
 (cd web && npm ci && npm run check)
 cargo fmt --all -- --check
+cargo test -p external-loader --target aarch64-apple-darwin --locked
+cargo clippy -p external-loader --target aarch64-apple-darwin --all-targets --locked -- -D warnings
+cargo clippy -p external-loader --target thumbv7em-none-eabihf --release --locked -- -D warnings
+cargo build -p external-loader --target thumbv7em-none-eabihf --release --locked
 cargo clippy -p m7 --release --features defmt --locked -- -D warnings
 cargo clippy -p m4 --release --features defmt --locked -- -D warnings
 cargo test -p shared --target aarch64-apple-darwin --lib --locked
@@ -80,6 +96,11 @@ cargo test -p m4 --target aarch64-apple-darwin --lib --locked
 cargo build -p m4 --release --features defmt --locked
 cargo build -p m7 --release --features defmt --locked
 ```
+
+The loader's package-only `build.rs` applies its linker script only to its Thumb
+binary; native binary tests exclude hardware and native builds use a no-op main.
+For the unqualified `.stldr` ELF copy command and limits, see README's read-only
+external loader section. No validated programming loader is supplied.
 
 The host test target above is for Apple silicon; use the actual host target on
 other machines. Keep the lockfiles reproducible. Also check logging-disabled
@@ -132,64 +153,39 @@ is a GDB server, not a DAP server.
   software tests do not establish these hardware results. Authorization alone
   is not evidence that provisioning or any hardware check completed.
 
-### Verified single-file installer
+### Intel HEX bootstrap
 
-`web/src/installer/{verify,install,cli,build}.ts` builds a Node 24 host-side
-`.installer.mjs`, not an image for the MCU. Runtime is offline, macOS/Linux, and
-requires an explicit CubeProgrammer executable, probe serial, independent trusted
-Ed25519 public key and durable backup directory. Verify-only is the default;
-`--install` is required for board access. The bootstrap must itself come from a
-trusted source: self-comparison with the signed runtime is consistency checking,
-not authentication of already executing untrusted code. Never embed a private key.
+The Node installer and its CLI/build path have been removed. `web/src/ota/hex.ts`,
+`build.ts` and `local.ts` generate offline artifacts only, with no board access.
+`build.ts bootstrap` emits `bootstrap.hex` and `BOOTSTRAP-WARNING.txt`; the local
+test builder emits `giga-usb-ota-bootstrap-test.hex`.
 
-Authenticate the MCUboot header/hash/key/signature before bounded decompression;
-reject archive traversal, duplicate/unknown members, links and malformed metadata.
-Validate checksums, core-specific ELF vectors/load ranges, dashboard bounds/CRC,
-loader identity and runtime manifests before executing any board command. The
-single installer embeds the same signed archive distributed separately; do not
-flash the container. CI builds the loader/runtime into that authenticated archive,
-then builds and verification-only tests the wrapper and uploads it as a fifth asset.
+HEX maps the 128-KiB FF-padded bootloader at `0x08000000`, the `0x1E0000`-byte
+padded ACTIVE at `0x08020000`, factory journal at `0x90200000`, allocation record
+at `0x90202000`, signed manifest at `0x90220000` and dashboard A at `0x90F00000`.
+External addresses are `0x90000000 + NOR offset`. No validated compatible external
+loader is supplied: an actual-part- and board-routing-specific compatible loader
+and reviewed procedure must be validated separately. No safe flashing command is
+provided. HEX does not initialize QSPI, check allocations, take/preserve backups,
+define erase policy or guarantee header-last writes. Unrepresented bytes are not
+implicitly erased; scratch, metadata B and dashboard B are not populated.
+Independently authenticate artifacts, establish allocation consent and backups,
+and verify readback. First provisioning is not power-fail-safe; retain SWD recovery.
+Do not mass erase or change option/protection/OTP/security settings.
 
-The standalone provisioning tool `firmware/m7/installer/loader.rs` is **not an
-application** or a second Cargo workspace. Its small, isolated unsafe boundary is
-for volatile register/RAM access in a reset-held diagnostic environment, not a
-relaxation of either application's unsafe-code prohibition. Build with
-`node web/src/installer/build.ts loader OUTPUT_DIRECTORY`; the source ABI is in
-`firmware/m7/installer/manifest.json`. Native tests use `rustc --edition 2024 --test
--D warnings firmware/m7/installer/loader.rs -o target/installer-loader-tests`.
-CI separately formats, tests and cross-builds this loader.
+### Historical Node installer evidence (not the HEX path)
 
-Loader code is confined to `0x24000000..0x24010000`; mailbox starts at
-`0x24010000`, data at `0x24012000`, stack below `0x20020000`. Every invocation
-checks HSI64/DIV1 and applied-divider readiness, clock dividers, M4 held, caches
-and MPU disabled, and advancing DWT before GPIO/SPI. Fixed JEDEC/SFDP gates and
-bounded WIP waits apply. Only reads, allocated 4-KiB sector replacement and final
-32-byte header commit are supported; never chip erase, status/protection writes,
-OTP/security or option writes. The host creates a fresh RAM-only ELF with standard
-section headers, records staged input before execution, and the loader checks input
-CRC before WREN. Short header input is padded in RAM only; flash length stays 32.
+The removed RC3 installer had its own bounded RAM-loader protocol; that source
+is not a supplied compatible external loader for programming HEX. The following
+results are historical and establish no current bootstrap guarantees.
 
-Installer policy: identify/release existing probe owners; never kill them. Use a
-per-probe lock, two independent full external reads, saved SHA-256, internal and
-all 41 actual Cube option/protection fields. Reject unknown configurations, stale
-sectors and arbitrary occupied ranges; `--replace-dashboard` approves only a valid
-existing dashboard. Program payload with erased header, verify all staged bytes,
-commit header last, compare the entire external array outside the touched range,
-then flash M4/M7 and compare every file-backed ELF load byte. Options must match
-exactly before final reset. Failed/uncertain writes are not retried automatically;
-record evidence and attempt bounded halt, never blindly boot partial firmware.
-`--resume-from` requires matching trusted prior backups, image/firmware/probe/options
-and fresh full reads; it accepts only an exact staged or committed image, not
-arbitrary damage. `--force-dashboard-rewrite` is an explicit test option requiring
-replacement consent and cannot be combined with resume.
-
-Installer validation passed: 208 web unit tests, 59 Chromium fixtures, 7 standalone
+Historical installer validation passed: 208 web unit tests, 59 Chromium fixtures, 7 standalone
 loader native tests and 165 application native tests. Separate per-core release
 Clippy/builds passed with and without logging. A local logging-disabled package
 passed the signing, payload comparison, installer build and verify-only flow.
 GitHub Actions itself was not executed for these uncommitted workflow changes.
 
-Current-board installer evidence is under `target/installer-validation/`:
+Historical board installer evidence is under `target/installer-validation/`:
 attempt 5 completed exact staged-header recovery; attempt 6 completed the normal
 97-sector replacement, header commit, M4/M7 readback and system reset. Outside-range
 bytes and option settings were preserved. These used ephemeral **test-only** keys
@@ -219,7 +215,7 @@ must not change option bytes, RDP, protection settings, OTP or security areas.
 The matching `## [<tag>]` entry in root `CHANGELOG.md` supplies the release notes;
 maintain an `Unreleased` section and add each tagged entry before releasing.
 Missing or empty entries fail the workflow. It packages both ELFs, the gzip UI,
-external QSPI container/metadata, verified installer runtime and RAM loader,
+external QSPI container/metadata and bootstrap/OTA artifacts,
 provisioning guidance, USB registry notices,
 changelog, checksums and build identity, then signs and
 verifies the archive with `imgtool` 2.5.0. `softprops/action-gh-release@v3` uploads
@@ -303,7 +299,11 @@ project. Decode release RTT using the exact corresponding ELF.
 
 ## Boot, memory and flashing
 
-- M7 flash: `0x08000000`, 1 MiB; private AXI SRAM: `0x24000000`, 512 KiB.
+**OTA branch:** the approved bootloader owns `0x08000000..0x08020000`, and M7's
+application is relocated to `0x08020000..0x08100000` (896 KiB). Legacy RC3
+instructions and historical measurements below do not provision this layout.
+Use the Intel HEX bootstrap requirements above, not partial application ELF downloads.
+M7 private AXI SRAM remains `0x24000000`, 512 KiB.
 - M4 flash: `0x08100000`, 1 MiB, ending at `0x08200000`; private SRAM1:
   `0x30000000`, 128 KiB. M7's M4 boot validation uses this application range.
 - There is no credential flash reservation or runtime credential store. Old
@@ -426,6 +426,91 @@ verified, including through the single installer; CDC reported proxy disabled an
 macOS enumerated CDC/boot-keyboard/boot-mouse interfaces. This does not validate
 actual forwarding or release behavior. Deploy both cores and the protocol-10 UI
 together.
+
+## Local OTA architecture
+
+This experimental branch uses the generic `embassy-boot 0.7` engine with an
+H747-specific RAM-resident flash/boot boundary. The linked STM32 adapter 0.6 uses
+HAL 0.4; adapter 0.8 matches our HAL 0.6, but its normal blocking flash path does
+not replace this project's bounded same-bank implementation. Keep the single
+four-member workspace (including the standalone external loader) and the
+applications' unsafe-code forbids.
+
+- Internal: bootloader `0x08000000..0x08020000`; combined ACTIVE
+  `0x08020000..0x08200000` is fifteen 128-KiB pages, with M4 still at `0x08100000`.
+  The bootloader runs operational code, constants and fault vectors from private
+  RAM during internal writes, holds M4, powers USB-A off, and uses bounded waits.
+- External: DFU/scratch `0..0x200000`; STATE reservation `0x200000..0x220000`;
+  metadata slots `0x220000` and `0x230000`; dashboards `0xF00000` and `0xE00000`
+  (1 MiB each). These are allocation proposals requiring independently verified fresh backups
+  and erased-range checks before provisioning. Do not treat an allocation marker alone
+  as permission to erase unknown contents.
+- Embassy STATE is a logical 64-byte NOR device over two 4-KiB sectors. The safe
+  `ota_state` adapter appends 128-byte CRC records with commit last and reclaims
+  only the inactive bank. Direct raw NOR state failed a torn-confirmation-erase
+  model; the journal is required, not optional. Factory seed ABI is `GIGAST01`,
+  first record CRC `0x5453a227`, remaining physical bytes erased. Runtime never
+  formats an unknown journal. Allocation consent is separately recorded at
+  `0x202000` using `GIGAAL01` plus layout and CRC.
+- OTA v1 is a 256-byte `GIGAOTA1` manifest, exactly `0x1E0000` padded ACTIVE bytes,
+  then the padded dashboard container. Signature is Ed25519 over
+  `SHA256(domain || manifest[0..192])`, where domain is ASCII
+  `GigaUSB OTA manifest v1` followed by one NUL byte. Signed fields bind
+  layout, protocol, image/dashboard hashes, core vectors and a 1–48-character
+  build ID. Node and Rust offsets must remain byte-for-byte compatible.
+- Signed metadata is selected by the complete ACTIVE hash, never recency. The
+  expected dashboard is selected by its signed hash in either slot. Old metadata
+  and assets survive a trial so rollback restores a coherent M7/M4/UI set.
+  Identical ACTIVE candidates are rejected; a dashboard-only release must change
+  the compiled build ID. OTA never updates the bootloader itself.
+- `GIGAUSB_OTA_PUBLIC_KEY_HEX` optionally overrides the default pinned RC3 public
+  key at compile time; `GIGAUSB_OTA_BUILD_ID` supplies the signed running ID.
+  Both are validated by `build.rs`; no private key is compiled. Cargo supplies
+  `OUT_DIR` for generated `ota_build.rs`, included at compile time by both bootloader
+  and application. These are build-time inputs, not production runtime environment
+  variables; the firmware does not read an OS environment. Local preparation
+  creates a clearly labelled test-only key and distinct A/B build IDs. Such
+  artifacts are not production releases, and sets with different keys cannot mix.
+- The bootloader starts IWDG and resumes swaps/rollback before entering an
+  authenticated application. M7 confirms only after matching signed build/assets,
+  compatible M4 Hello, fresh nonce Pong, AP readiness, DHCP and three HTTP-worker
+  starts, with host/proxy stopped. These are service-initialization checks, not
+  successful HTTP delivery or browser health. A browser/peripheral is not needed.
+- Long staging/verification feeds IWDG only for a previously confirmed healthy
+  image with fresh M4 health and bounded progress. Initial authentication never
+  feeds; the 20-second application startup budget versus worst-case LSI timing
+  still requires physical qualification. No formal timing/stack claim is made.
+- Runtime NOR operations are exclusively owned by an independent OTA task. HTTP
+  cancellation cannot drop an active erase/program. Commands Start/Reset/proxy
+  Enable are blocked during maintenance. Previously authorized input must have a
+  confirmed release before staging; disable alone is insufficient.
+- HTTP uses `/api/update/status` (GET) and authorize/begin/chunk/commit/cancel
+  (POST). Mutations require Origin `http://192.168.4.1`, binary Content-Type and
+  `X-GigaUSB-Update: 1`; after authorization they require the current token, and
+  chunks require absolute offsets starting at 256. Requests are bounded to 4096
+  bytes, manifests to 256. HTTP 202 is queue admission, not durable progress.
+- Origin/intent headers reject browser CSRF; tokens guard stale requests. They
+  are not authentication against an AP client. The open AP remains trusted-only.
+  Signatures authenticate content, not upload-client identity. No anti-rollback
+  version counter, key rotation or irreversible security setting is introduced.
+- The UI polls status only during explicit status/upload/install actions. It never
+  automatically retries POSTs. Lost commit responses are reconciled read-only;
+  transport failures do not prove rollback. Success requires the exact candidate
+  build ID and `confirmed: true`. Explicit cancellation accepts token clearing
+  only with the firmware's complete cancelled state; it does not undo staging.
+
+Initial SWD bootstrap uses the Intel HEX mapping and limitations above, not the
+removed Node installer. HEX is neither an authenticated distribution container
+nor an OTA upload. Its allocation record does not authorize erasure or prove
+that unrepresented ranges are erased. First provisioning is not power-fail-safe.
+
+Local artifacts are built by `node web/src/ota/local.ts --output ABSOLUTE_NEW_TARGET_DIRECTORY
+[--defmt]`. This does not access the board. Retain the exact A/B pair, public key,
+ELFs and checksums; keep its private test key local and never publish it. Current
+qualification is software/model/offline-artifact validation only. Bootstrap,
+watchdog timing, trial confirmation, upload delivery, repeated power cuts,
+physical rollback, and concurrent USB/AP behavior remain hardware NOT RUN.
+Retain SWD recovery and do not describe these images as a validated release.
 
 ## IPC and contracts
 
@@ -621,6 +706,12 @@ Apply/reload required changes and power-cycle. Incorrect options can block boot/
 M4 is not a standalone image: it requires M7 initialization.
 
 ### Flash, log and debug
+
+**OTA branch:** partial application downloads, including `cargo run`, invalidate
+signed ACTIVE metadata. Follow the HEX bootstrap requirements for initial migration and
+`.ota.bin` uploads thereafter. The legacy commands below are retained for RC3
+and earlier images only. Attach RTT to the exact retained ELF without programming;
+do not use a flashing command merely to collect logs.
 
 **M7 overwrites the Arduino bootloader.** Arduino USB uploading and double-reset
 recovery require restoring that bootloader over SWD.

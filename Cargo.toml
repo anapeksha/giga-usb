@@ -1,6 +1,6 @@
 [workspace]
 # Build each core separately: their HAL chip features are incompatible.
-members = ["firmware/m7", "firmware/m4", "firmware/shared"]
+members = ["firmware/m7", "firmware/m4", "firmware/shared", "firmware/m7/external-loader"]
 default-members = ["firmware/m7"]
 exclude = ["vendor/cyw43"]
 resolver = "3"

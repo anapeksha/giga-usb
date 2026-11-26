@@ -8,6 +8,12 @@ license.workspace = true
 name = "m7"
 path = "src/main.rs"
 
+[[bin]]
+name = "bootloader"
+path = "src/bootloader/main.rs"
+test = false
+bench = false
+
 [features]
 default = []
 defmt = ["shared/defmt", "dep:defmt-rtt", "embassy-stm32/defmt", "embassy-time/defmt"]
@@ -16,12 +22,19 @@ defmt = ["shared/defmt", "dep:defmt-rtt", "embassy-stm32/defmt", "embassy-time/d
 workspace = true
 
 [dependencies]
+embassy-boot = "=0.7.0"
+embedded-storage = "=0.3.2"
+sha2 = { version = "=0.10.9", default-features = false, features = ["force-soft-compact"] }
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["fast"] }
 postcard.workspace = true
 shared.workspace = true
 heapless.workspace = true
 serde.workspace = true
 serde-json-core.workspace = true
 embassy-net-driver = "0.2.0"
+
+[dev-dependencies]
+ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["fast", "zeroize"] }
 
 [target.'cfg(target_os = "none")'.dependencies]
 cortex-m.workspace = true

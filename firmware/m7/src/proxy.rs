@@ -6,6 +6,7 @@ use shared::usb::proxy::*;
 pub struct Proxy(RefCell<State>);
 struct State {
     status: ProxyStatus,
+    input_was_authorized: bool,
     reset: Option<HostToProxy>,
     queue: Deque<HostToProxy, FORWARD_QUEUE_CAPACITY>,
     outstanding: Deque<(u32, u64), FORWARD_QUEUE_CAPACITY>,
@@ -39,6 +40,7 @@ impl Proxy {
                 rejected_reports: 0,
                 led_failures: 0,
             },
+            input_was_authorized: false,
             reset: None,
             queue: Deque::new(),
             outstanding: Deque::new(),
@@ -50,6 +52,9 @@ impl Proxy {
             snapshot: None,
             support_notice: None,
         }))
+    }
+    pub fn input_was_authorized(&self) -> bool {
+        self.0.borrow().input_was_authorized
     }
     pub fn status(&self) -> ProxyStatus {
         self.0.borrow().status
@@ -300,6 +305,7 @@ impl Proxy {
 }
 impl State {
     fn reset(&mut self, enabled: bool) {
+        self.input_was_authorized |= enabled;
         self.status.enabled = enabled;
         self.status.ready = false;
         if self.status.release != ProxyRelease::Failed {

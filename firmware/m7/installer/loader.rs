@@ -28,7 +28,11 @@ fn valid_request(v: &[u32; 8]) -> bool {
     let (op, offset, len) = (v[2], v[3], v[4]);
     match op {
         1 => len > 0 && len <= 262144 && offset < END && len <= END - offset,
-        2 => (BASE..END).contains(&offset) && offset % 4096 == 0 && len == 4096,
+        2 => {
+            ((0x200000..0x240000).contains(&offset) || (0xe00000..END).contains(&offset))
+                && offset % 4096 == 0
+                && len == 4096
+        }
         3 => offset == BASE && len == 32,
         _ => false,
     }
@@ -450,15 +454,29 @@ mod tests {
     }
     #[test]
     fn sector_bounds() {
-        assert!(valid_request(&request(2, BASE, 4096)));
+        for offset in [0x200000, 0x202000, 0x220000, 0x23f000, 0xe00000, BASE] {
+            assert!(valid_request(&request(2, offset, 4096)));
+            assert!(!valid_request(&request(3, offset, 4096)));
+        }
         assert!(valid_request(&request(2, END - 4096, 4096)));
         for (o, n) in [
-            (BASE - 4096, 4096),
+            (0xdff000, 4096),
+            (0x1ff000, 4096),
+            (0x240000, 4096),
             (BASE + 1, 4096),
             (END, 4096),
             (BASE, 8192),
         ] {
             assert!(!valid_request(&request(2, o, n)));
+        }
+    }
+    #[test]
+    fn bootstrap_does_not_authorize_dfu_or_arbitrary_sectors() {
+        for offset in (0..END).step_by(4096) {
+            let allowed =
+                (0x200000..0x240000).contains(&offset) || (0xe00000..END).contains(&offset);
+            assert_eq!(valid_request(&request(2, offset, 4096)), allowed);
+            assert_eq!(valid_request(&request(3, offset, 32)), offset == BASE);
         }
     }
     #[test]

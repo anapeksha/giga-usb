@@ -1,0 +1,15 @@
+[package]
+name = "external-loader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "external-loader"
+path = "loader.rs"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+large_stack_frames = "deny"
+mem_forget = "deny"

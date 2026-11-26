@@ -1,7 +1,8 @@
 import { createHash, generateKeyPairSync, sign } from 'node:crypto';
 import { gzipSync } from 'node:zlib';
 import { describe, expect, it } from 'vitest';
-import { parseElfSegments, verifyDistribution } from './verify';
+import { paddedElf, parseElfSegments, verifyDistribution } from './verify';
+import { allocationRecord, buildOta, journalSeed, otaLayout } from '../ota/format';
 
 const pair = generateKeyPairSync('ed25519');
 const publicPem = pair.publicKey.export({ format: 'pem', type: 'spki' });
@@ -122,6 +123,105 @@ function archive(files = fixture(), mutate?: (tar: Buffer) => Buffer) {
   return signed(gzipSync(mutate ? mutate(tar) : tar));
 }
 const verify = (b: Buffer) => verifyDistribution(b, publicPem);
+
+function bootstrapFixture() {
+  const files = fixture();
+  const m7 = elf('m7');
+  for (const offset of [24, 60, 64, 260])
+    m7.writeUInt32LE(m7.readUInt32LE(offset) + 0x20000, offset);
+  files.set('m7.elf', m7);
+  files.set('bootloader.elf', elf('m7'));
+  const active = Buffer.concat([
+    paddedElf(m7, 'm7-ota', 0x08020000, 0xe0000),
+    paddedElf(files.get('m4.elf')!, 'm4', 0x08100000, 0x100000),
+  ]);
+  const ota = buildOta(active, files.get('dashboard.qspi.bin')!, pair.privateKey, 'bootstrap-test');
+  files.set('ota-active.bin', active);
+  files.set('ota-manifest.bin', ota.subarray(0, 256));
+  files.set('ota-state.bin', journalSeed());
+  files.set('ota-allocation.bin', allocationRecord());
+  files.set('ota-layout.json', Buffer.from(JSON.stringify(otaLayout('bootstrap-test', publicPem))));
+  return files;
+}
+
+describe('OTA bootstrap authentication', () => {
+  it('authenticates an exact complete bootstrap profile', () => {
+    const result = verify(archive(bootstrapFixture()));
+    expect(result.layout).toEqual(otaLayout('bootstrap-test', publicPem));
+    expect(() => parseElfSegments(result.files.get('m7.elf')!, 'm7')).toThrow();
+    expect(() => parseElfSegments(elf('m7'), 'm7-ota')).toThrow();
+  });
+  it.each([
+    'bootloader.elf',
+    'ota-active.bin',
+    'ota-manifest.bin',
+    'ota-state.bin',
+    'ota-allocation.bin',
+    'ota-layout.json',
+  ])('rejects missing profile member %s', (name) => {
+    const files = bootstrapFixture();
+    files.delete(name);
+    expect(() => verify(archive(files))).toThrow(/Incomplete OTA/);
+  });
+  it.each(['ota-state.bin', 'ota-allocation.bin', 'ota-manifest.bin', 'ota-active.bin'])(
+    'rejects rechecksummed corrupt %s',
+    (name) => {
+      const files = bootstrapFixture();
+      files.get(name)![100 % files.get(name)!.length] ^= 1;
+      expect(() => verify(archive(files))).toThrow();
+    },
+  );
+  it('rejects a manifest signed by an archive-supplied rather than trusted key', () => {
+    const files = bootstrapFixture();
+    const other = generateKeyPairSync('ed25519');
+    const ota = buildOta(
+      files.get('ota-active.bin')!,
+      files.get('dashboard.qspi.bin')!,
+      other.privateKey,
+      'bootstrap-test',
+    );
+    files.set('ota-manifest.bin', ota.subarray(0, 256));
+    expect(() => verify(archive(files))).toThrow(/signature/i);
+    files.set(
+      'ota-layout.json',
+      Buffer.from(JSON.stringify(otaLayout('bootstrap-test', other.publicKey))),
+    );
+    expect(() => verify(archive(files))).toThrow(/trusted key/);
+  });
+  it('rejects correctly signed ACTIVE containing non-FF ELF gaps', () => {
+    const files = bootstrapFixture();
+    files.get('ota-active.bin')![0x100] = 0;
+    files.set(
+      'ota-manifest.bin',
+      buildOta(
+        files.get('ota-active.bin')!,
+        files.get('dashboard.qspi.bin')!,
+        pair.privateKey,
+        'bootstrap-test',
+      ).subarray(0, 256),
+    );
+    expect(() => verify(archive(files))).toThrow(/FF gaps/);
+  });
+  it('rejects mismatched build ID and wrong core ELF', () => {
+    const files = bootstrapFixture();
+    files.set(
+      'ota-layout.json',
+      Buffer.from(JSON.stringify(otaLayout('another-build', publicPem))),
+    );
+    expect(() => verify(archive(files))).toThrow(/build identity/);
+    files.set('bootloader.elf', elf('m4'));
+    expect(() => verify(archive(files))).toThrow();
+  });
+  it('allows bootloader RAM virtual loads with strictly boot-flash physical bytes', () => {
+    const b = elf('m7');
+    b.writeUInt32LE(2, 44);
+    [1, 264, 0x24000000, 0x08000100, 4, 4, 5, 4].forEach((v, i) => b.writeUInt32LE(v, 84 + i * 4));
+    const image = Buffer.concat([b, Buffer.alloc(4)]);
+    expect(parseElfSegments(image, 'bootloader')).toHaveLength(2);
+    image.writeUInt32LE(0x08020000, 96);
+    expect(() => parseElfSegments(image, 'bootloader')).toThrow(/physical/);
+  });
+});
 
 describe('offline distribution verifier', () => {
   it('authenticates a complete bundle and preserves exact non-semver identity', () => {

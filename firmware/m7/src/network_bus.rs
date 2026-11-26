@@ -10,6 +10,16 @@ use shared::{
 
 pub use shared::protocol::RECORD_BYTES;
 const HISTORY: usize = 64;
+#[derive(serde::Deserialize)]
+struct HelloRecord {
+    event: HelloEvent,
+}
+#[derive(serde::Deserialize)]
+struct HelloEvent {
+    #[serde(rename = "type")]
+    kind: String<8>,
+    protocol_version: u32,
+}
 /// Single-executor command queue and complete-record history; not cross-core synchronization.
 pub struct Bus(RefCell<State>, [SubscriberSlot; 2]);
 
@@ -60,6 +70,13 @@ struct State {
     dropped: u32,
     network: Option<NetworkInfo>,
     led: Input,
+    maintenance: bool,
+    m4_compatible: bool,
+    ping: Option<u32>,
+    pong_ms: Option<u64>,
+    http_workers: u8,
+    dhcp_ready: bool,
+    host_stopped: bool,
 }
 impl Default for Bus {
     fn default() -> Self {
@@ -78,6 +95,13 @@ impl Bus {
                 dropped: 0,
                 network: None,
                 led: Input::new(),
+                maintenance: false,
+                m4_compatible: false,
+                ping: None,
+                pong_ms: None,
+                http_workers: 0,
+                dhcp_ready: false,
+                host_stopped: false,
             }),
             [SubscriberSlot::new(), SubscriberSlot::new()],
         )
@@ -158,7 +182,68 @@ impl Bus {
     }
 
     pub fn observe_host(&self, event: &UsbEvent, now_ms: u64) {
-        self.0.borrow_mut().led.observe(event, now_ms);
+        let mut s = self.0.borrow_mut();
+        s.led.observe(event, now_ms);
+        if let UsbEvent::Status {
+            enabled, attached, ..
+        } = event
+        {
+            s.host_stopped = !enabled && !attached;
+        }
+    }
+
+    pub fn maintenance(&self) -> bool {
+        self.0.borrow().maintenance
+    }
+    pub fn set_maintenance(&self, enabled: bool) {
+        let mut s = self.0.borrow_mut();
+        s.maintenance = enabled;
+        if enabled {
+            s.host_stopped = false;
+            s.commands.clear();
+            let _ = s.commands.push_back(HostCommand::Stop);
+        }
+    }
+    pub fn host_stopped(&self) -> bool {
+        self.0.borrow().host_stopped
+    }
+    pub fn expect_pong(&self, nonce: u32) {
+        self.0.borrow_mut().ping = Some(nonce);
+    }
+    pub fn pong(&self, message: &Message, now: u64) {
+        let Some(bytes) = message.value.as_ref() else {
+            return;
+        };
+        let Ok(bytes) = <[u8; 4]>::try_from(bytes.as_slice()) else {
+            return;
+        };
+        let mut s = self.0.borrow_mut();
+        if s.ping == Some(u32::from_le_bytes(bytes)) {
+            s.pong_ms = Some(now);
+            s.ping = None;
+        }
+    }
+    pub fn ipc_healthy(&self, now: u64) -> bool {
+        self.0
+            .borrow()
+            .pong_ms
+            .is_some_and(|at| now.saturating_sub(at) < 3000)
+    }
+    pub fn http_started(&self) {
+        let mut s = self.0.borrow_mut();
+        s.http_workers = s.http_workers.saturating_add(1);
+    }
+    pub fn dhcp_started(&self) {
+        self.0.borrow_mut().dhcp_ready = true;
+    }
+    pub fn boot_healthy(&self) -> bool {
+        let s = self.0.borrow();
+        s.m4_compatible
+            && s.http_workers == 3
+            && s.dhcp_ready
+            && s.network
+                .as_ref()
+                .is_some_and(|n| n.mode.as_str() == "setup" && n.ip.is_some() && n.error.is_none())
     }
 
     pub fn network(&self) -> Option<NetworkInfo> {
@@ -168,7 +253,16 @@ impl Bus {
     /// Queue a command without waiting; `true` means accepted, not completed.
     /// On `false` the caller must retry or report backpressure.
     pub fn command(&self, command: HostCommand) -> bool {
-        self.0.borrow_mut().commands.push_back(command).is_ok()
+        let mut s = self.0.borrow_mut();
+        if s.maintenance
+            && matches!(
+                command,
+                HostCommand::Start | HostCommand::ProxyEnable { .. } | HostCommand::Reset
+            )
+        {
+            return false;
+        }
+        s.commands.push_back(command).is_ok()
     }
     /// Publish a bounded generic diagnostic without observing a USB host event.
     pub fn publish_ipc_error(&self, total: u32, timestamp_ms: u64) -> bool {
@@ -243,6 +337,21 @@ impl Bus {
             s.cursor = s.cursor.wrapping_add(1);
             let cursor = s.cursor;
             let record = core::mem::take(&mut s.assembly);
+            if let Ok((
+                HelloRecord {
+                    event:
+                        HelloEvent {
+                            kind,
+                            protocol_version,
+                        },
+                },
+                used,
+            )) = serde_json_core::from_slice::<HelloRecord>(&record)
+                && used == record.len()
+                && kind.as_str() == "hello"
+            {
+                s.m4_compatible = protocol_version == shared::protocol::PROTOCOL_VERSION;
+            }
             if s.records.is_full() {
                 s.records.pop_front();
             }
@@ -403,6 +512,70 @@ mod tests {
         },
         task::Wake,
     };
+
+    #[test]
+    fn trial_health_requires_real_schema_network_workers_and_fresh_nonce_pong() {
+        let bus = Bus::new();
+        bus.set_network(NetworkInfo {
+            mode: String::try_from("setup").unwrap(),
+            mac: [1; 6],
+            ip: Some(String::try_from("192.168.4.1").unwrap()),
+            error: None,
+        });
+        for _ in 0..3 {
+            bus.http_started();
+        }
+        bus.dhcp_started();
+        assert!(!bus.boot_healthy());
+        bus.receive(
+            &Message::with_payload(
+                Event::Ui,
+                b"\x03{\"timestamp_ms\":0,\"event\":{\"type\":\"hello\",\"protocol_version\":9}}",
+            )
+            .unwrap(),
+        );
+        assert!(!bus.boot_healthy());
+        bus.receive(
+            &Message::with_payload(
+                Event::Ui,
+                b"\x03{\"timestamp_ms\":0,\"event\":{\"type\":\"hello\",\"protocol_version\":10}}",
+            )
+            .unwrap(),
+        );
+        assert!(bus.boot_healthy());
+        assert!(!bus.ipc_healthy(0));
+        bus.expect_pong(42);
+        bus.pong(
+            &Message::with_payload(Event::Pong, &41u32.to_le_bytes()).unwrap(),
+            100,
+        );
+        assert!(!bus.ipc_healthy(100));
+        bus.pong(
+            &Message::with_payload(Event::Pong, &42u32.to_le_bytes()).unwrap(),
+            100,
+        );
+        assert!(bus.ipc_healthy(3099));
+        assert!(!bus.ipc_healthy(3100));
+        // No subscriber, browser, physical USB attachment or HID output is needed.
+        assert!(!bus.host_stopped());
+    }
+
+    #[test]
+    fn maintenance_purges_queued_enables_and_requires_fresh_stop_evidence() {
+        let bus = Bus::new();
+        assert!(bus.command(HostCommand::Start));
+        assert!(bus.command(HostCommand::ProxyEnable { generation: 1 }));
+        bus.set_maintenance(true);
+        assert_eq!(bus.next_command(), Some(HostCommand::Stop));
+        assert_eq!(bus.next_command(), None);
+        assert!(!bus.command(HostCommand::Start));
+        assert!(!bus.command(HostCommand::ProxyEnable { generation: 1 }));
+        assert!(!bus.command(HostCommand::Reset));
+        assert!(bus.command(HostCommand::Status));
+        assert!(!bus.host_stopped());
+        bus.set_maintenance(false);
+        assert!(bus.command(HostCommand::Start));
+    }
 
     #[derive(Default)]
     struct Wakes(AtomicUsize);
