@@ -1,12 +1,17 @@
 [package]
-name = "external-loader"
+name = "loader"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
 
+# Tooling-only opt-in; neither application gains a behavior feature.
+[features]
+default = []
+programming = []
+
 [[bin]]
-name = "external-loader"
+name = "loader"
 path = "loader.rs"
 
 [lints.clippy]

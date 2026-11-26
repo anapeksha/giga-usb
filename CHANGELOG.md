@@ -9,6 +9,10 @@ and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Isolated Cargo `loader` tooling under `firmware/loader`, alongside both cores
+  and shared, with default read-only behavior and a
+  separately opted-in, range-limited programming qualification build. Mass erase
+  is always refused; complete HEX programming remains hardware-unqualified.
 - Experimental local OTA updates through the dashboard using one signed `.ota.bin`,
   bounded uploads, explicit install/restart and exact build-confirmation checks.
 - A persistent bootloader using Embassy's combined-image swap engine with an

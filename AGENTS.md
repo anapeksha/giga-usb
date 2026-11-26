@@ -14,12 +14,15 @@ handshakes, CRCs, bus timing and arbitrary external traffic are not captured.
 ## Workspace and ownership
 
 - Keep one four-member Cargo workspace: `firmware/m7`, `firmware/m4`,
-  `firmware/shared` and `firmware/m7/external-loader` (package `external-loader`).
+  `firmware/shared` and `firmware/loader` (package `loader`).
   The standalone external loader is the explicit tooling exception; its unsafe
   boundary stays isolated and does not relax either application's unsafe forbid.
-  Its Write, SectorErase and MassErase callbacks must continue refusing requests
-  until programming is separately approved and qualified. Build/test it separately;
-  no hardware access is part of its software checks.
+  Default builds refuse Write, SectorErase and MassErase. The tooling-only
+  `programming` feature enables scoped Write/SectorErase qualification; MassErase
+  always refuses. It does not add an application feature or authorize arbitrary
+  writes. Full programming remains unqualified; see README for partial hardware
+  evidence and the journal-sector test pattern awaiting erase. Build/test both
+  loader modes separately; no hardware access is part of software checks.
 - M7 owns USB-A host control, scheduling, capture, Wi-Fi, HTTP and OTA staging.
   Its additional `bootloader` binary owns reset-time swap/authentication and the
   first 128-KiB internal sector; it is a binary in M7, not a workspace member.
@@ -84,10 +87,10 @@ provenance, scoped lookup and license notices when updating. No runtime Internet
 ```sh
 (cd web && npm ci && npm run check)
 cargo fmt --all -- --check
-cargo test -p external-loader --target aarch64-apple-darwin --locked
-cargo clippy -p external-loader --target aarch64-apple-darwin --all-targets --locked -- -D warnings
-cargo clippy -p external-loader --target thumbv7em-none-eabihf --release --locked -- -D warnings
-cargo build -p external-loader --target thumbv7em-none-eabihf --release --locked
+cargo test -p loader --target aarch64-apple-darwin --locked
+cargo clippy -p loader --target aarch64-apple-darwin --all-targets --locked -- -D warnings
+cargo clippy -p loader --target thumbv7em-none-eabihf --release --locked -- -D warnings
+cargo build -p loader --target thumbv7em-none-eabihf --release --locked
 cargo clippy -p m7 --release --features defmt --locked -- -D warnings
 cargo clippy -p m4 --release --features defmt --locked -- -D warnings
 cargo test -p shared --target aarch64-apple-darwin --lib --locked
@@ -99,8 +102,10 @@ cargo build -p m7 --release --features defmt --locked
 
 The loader's package-only `build.rs` applies its linker script only to its Thumb
 binary; native binary tests exclude hardware and native builds use a no-op main.
-For the unqualified `.stldr` ELF copy command and limits, see README's read-only
-external loader section. No validated programming loader is supplied.
+For the `.stldr` ELF copy command and limits, see README's external loader
+qualification section. Check both default and `--features programming` loader
+builds; neither software checks nor the single page-crossing write establish a
+qualified complete HEX programming procedure.
 
 The host test target above is for Apple silicon; use the actual host target on
 other machines. Keep the lockfiles reproducible. Also check logging-disabled

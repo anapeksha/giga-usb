@@ -54,7 +54,7 @@ cargo build -p m7 --release --features defmt --locked
 ```
 
 The single Cargo workspace has four members: `firmware/m7`, `firmware/m4`,
-`firmware/shared` and `firmware/m7/external-loader` (package `external-loader`).
+`firmware/shared` and `firmware/loader` (package `loader`).
 Build each core and the standalone loader separately; do not use `--workspace`
 or `--all-features` for firmware builds. The M7 package also builds `bootloader`
 with its separate linker layout; that binary is not a workspace member. Normal builds use the pinned production public key; the local test builder
@@ -111,28 +111,30 @@ bytes, protection or OTP/security settings. Partial application ELF downloads do
 not establish a valid signed OTA installation. Historical RC3 installer results
 do not validate this HEX path.
 
-### Read-only external loader qualification candidate
+### External loader qualification candidate
 
-`firmware/m7/external-loader/` is the standalone `external-loader` workspace
+`firmware/loader/` is the standalone `loader` workspace
 package. Its unsafe hardware boundary is isolated from the applications, which
 continue to forbid unsafe code. From the repository root (native target below
 is for Apple silicon; use `x86_64-unknown-linux-gnu` on Linux):
 
 ```sh
-cargo test -p external-loader --target aarch64-apple-darwin --locked
-cargo clippy -p external-loader --target aarch64-apple-darwin --all-targets --locked -- -D warnings
-cargo clippy -p external-loader --target thumbv7em-none-eabihf --release --locked -- -D warnings
-cargo build -p external-loader --target thumbv7em-none-eabihf --release --locked
-cp target/thumbv7em-none-eabihf/release/external-loader target/GIGA_AT25_READONLY_UNQUALIFIED.stldr
+cargo test -p loader --target aarch64-apple-darwin --locked
+cargo clippy -p loader --target aarch64-apple-darwin --all-targets --locked -- -D warnings
+cargo clippy -p loader --target thumbv7em-none-eabihf --release --locked -- -D warnings
+cargo build -p loader --target thumbv7em-none-eabihf --release --locked
+cp target/thumbv7em-none-eabihf/release/loader target/GIGA_AT25_READONLY_UNQUALIFIED.stldr
 ```
 
 The package build script supplies loader-only linker flags on the Thumb target;
 native binary tests exclude all hardware code and native builds have a no-op
 entry point. The `.stldr` copy retains the ELF's symbols and load segments; do
 not use a raw objcopy binary. Record `rustc -Vv` for reproducibility; stable is
-a moving toolchain. These commands do not access hardware. No hardware
-qualification has run, and Write, SectorErase and MassErase still refuse all
-requests. This candidate cannot program the bootstrap HEX.
+a moving toolchain. These commands do not access hardware. Read-only board
+qualification passed on 2026-11-26 with CubeProgrammer 2.24.0. Default builds
+still refuse Write, SectorErase and MassErase. A separately opted-in `programming`
+build exists for controlled qualification; it is not yet qualified for the complete
+bootstrap HEX.
 
 ABI provenance:
 
@@ -150,17 +152,32 @@ ABI provenance:
   to SPI command `03`, decrements Size per byte stored, and returns 1 on success.
   This confirms the existing Rust Read signature and byte units.
 
-**Tool stack/buffer allocation remains unresolved.** The official SPI example
-uses the caller's stack, but does not establish its location. The official H7
-contrib linker example's `_estack`/stack reservation does not prove CubeProgrammer
-honors it. The inspected API header exposes no allocation contract. The candidate
-therefore retains its own restrictive policy: code/constants at
-`0x24000004..0x24010000`, buffers wholly in `0x24010000..0x24070000`, and a required
-valid 8-byte-aligned caller stack in `0x24070000..0x24080000`. These are prerequisites,
-not verified tool allocations; there is no startup, heap or data/BSS initialization.
+**Tool allocation evidence is specific to the observed Cube run, not an API
+contract.** The guarded candidate completed Init with the required JEDEC/status
+checks. A subsequent 256-byte Read supplied output `0x24000E80` and MSP
+`0x24000E50` with the first load at `0x24000004`, length `0xA50`; the former fixed
+buffer arena rejected it. Read now requires output at least `__loader_code_end +
+0x400`, a nonempty range ending at or below `0x24070000`, and sampled in-callback
+MSP aligned to eight bytes, at least `__loader_code_end + 0x100` and at most
+`output - 32`. Checked arithmetic rejects overflow. The linker derives
+`__loader_code_end` from the first loaded segment, including a file-backed tail,
+before `.Dev_Info`; the observed tool does not load that separate metadata segment.
+A later CubeProgrammer 2.24 run with loaded end `0x24000B90` supplied output
+`0x24000FC0`, entry MSP `0x24000F8C` and in-callback MSP `0x24000F54`, failing
+only eight-byte alignment. Measured entry MSP is loaded end plus `0x3FC`.
+The ELF-loaded tail aligns to eight bytes then appends a zero word, with a linker
+assertion that loaded end is four modulo eight. This preserves the runtime
+alignment check and aligns entry MSP for that measured placement, not a universal
+tool allocation contract. The padded build subsequently passed board reads.
+Read diagnostics retain address, length, output and sampled MSP. Allocation must
+be rechecked for each build/tool; neither the observed spacing nor compiled stack
+review is a formal stack bound. There is no startup,
+heap or data/BSS initialization.
 
 The hardware boundary was reviewed against `firmware/m7/installer/loader.rs`.
-Before GPIO access, Init/Read require privileged M7 thread/MSP, PRIMASK=1,
+Init/Read first require privileged M7 thread/MSP before masking interrupts locally;
+the caller's exact entry PRIMASK is restored on every return path. Before GPIO
+access, the unchanged gate requires PRIMASK=1 under that scoped mask,
 M4 never released (BOOT_C2=0 and current BCM4=0), HSI ready/DIV1 and selected,
 canonical D1 dividers, caches/MPU disabled and QUADSPI clock gated. Caller must
 establish a reviewed reset/halt procedure, valid stack, and exclusion of other
@@ -168,14 +185,48 @@ bus masters/watchdogs; checks alone do not establish these conditions. No safe
 board-invocation command is supplied.
 
 GPIO mode 0 uses PD11 MOSI, PD12 MISO, PE2/PF6 IO2/IO3 high, PF10 CLK and PG6 CS.
-Only `9F` (exact JEDEC `1f8901`), `05` (reject WIP/WEL) and bounded `03` reads
-are implemented; CS releases every 256 bytes. JEDEC is not full part/SFDP
-qualification. Write, SectorErase and MassErase always fail without hardware
-access: **no programming build or enable flag exists**. Verify/CheckSum are
-omitted; tool fallback support is unqualified. Timing, callback allocation,
-Init failure cases and independent readback against trusted backups still need
-qualification. This candidate cannot provision HEX or enforce image ordering;
-no erase, security/OTP or option-byte changes are authorized by it.
+The read-only path uses `9F` (exact JEDEC `1f8901`), `05` (reject WIP/WEL) and
+bounded `03` reads; CS releases every 256 bytes. JEDEC is not full part/SFDP
+qualification. Verify/CheckSum are omitted; tool fallback support is unqualified.
+Read-only qualification completed two
+independent full-chip reads in 256-KiB requests; their 16-MiB outputs matched
+byte-for-byte (SHA-256 `8bc0b9af538b99dd3b40b2969d4646d0865a568261bc83b65aad646a1b537460`).
+A single 16-MiB callback request was rejected by the bounded buffer policy.
+Internal 2-MiB readback and 46 displayed option fields were unchanged, then a
+system reset returned control to existing firmware. Logs, snapshots and backups
+are under `target/external-loader-qualification/`. These local snapshots do not
+replace durable backups outside the repository before programming. Init failure
+coverage, complete programming/erase, power-failure and OTA qualification remain
+outstanding. The loader cannot authenticate HEX or enforce image ordering.
+
+The tooling-only `programming` feature does not change application features or
+unsafe boundaries. Run the same loader checks above with `--features programming`
+to test/build the opt-in candidate. Preserve each exact ELF separately: both modes
+overwrite the same Cargo binary output. MassErase refuses in every mode.
+
+Programming is scoped to NOR offsets `0x200000..0x203000`, `0x220000..0x221000`
+and dashboard A `0xF00000..0x1000000`; the host must further restrict writes to
+verified image sectors. Write accepts at most 4096 bytes, preflights one-to-zero
+transitions, splits on 256-byte pages and verifies readback. SectorErase accepts
+one aligned 4-KiB sector, with the last argument either its base (observed Cube
+2.24 convention) or its inclusive last byte. Multisector requests refuse.
+
+Command/status masks follow Renesas AT25SF128A/AT25QF128A datasheet
+DS-AT25SF/QF128A-168 Rev Q (2025-08-26), using only `06/04` WREN/WRDI, `02` page
+program, `20` sector erase and `05/35/15` status. No status, OTP/security, chip-erase
+or option-byte writes exist. DWT must advance before WREN; each busy wait has a
+64-million-cycle deadline at gated 64-MHz HSI plus a 4096-poll limit. Timeout can
+leave NOR busy or earlier pages written; do not blindly retry or resume firmware.
+
+Hardware qualification programmed a 513-byte page-crossing pattern in the allocated
+journal sector at `0x90200000`; independent full-sector readback matched exactly.
+Cube's subsequent erase call used identical start/end sector bases and was safely
+refused by the earlier envelope policy. The corrected policy passes native tests,
+but the retry found no ST-LINK. **The test pattern has not been erased and no OTA
+bootstrap has been installed.** Reconnect the ST-LINK before resuming erase/readback
+qualification. The CMSIS-DAP probe currently detected by probe-rs is not the
+CubeProgrammer ST-LINK transport. Verified backup copies are also retained outside
+the repository at `../giga-usb-backups/ota-bootstrap-2026-11-26/`.
 
 ## Use
 

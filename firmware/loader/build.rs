@@ -7,9 +7,6 @@ fn main() {
     }
 
     let script = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("loader.x");
-    println!(
-        "cargo:rustc-link-arg-bin=external-loader=-T{}",
-        script.display()
-    );
-    println!("cargo:rustc-link-arg-bin=external-loader=--build-id=none");
+    println!("cargo:rustc-link-arg-bin=loader=-T{}", script.display());
+    println!("cargo:rustc-link-arg-bin=loader=--build-id=none");
 }
